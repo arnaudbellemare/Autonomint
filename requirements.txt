@@ -1,0 +1,21 @@
+ccxt
+      
+# For the web application framework
+streamlit
+
+# For data manipulation and analysis
+pandas
+
+# For numerical operations (often a dependency of pandas)
+numpy
+
+# For making HTTP requests to APIs
+requests
+
+# For interacting with cryptocurrency exchanges (historical data)
+
+
+# For creating interactive charts
+altair
+
+    
