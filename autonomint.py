@@ -152,10 +152,12 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
+# --- THIS IS THE FINAL, HOLISTIC SCREENER FUNCTION ---
 @st.cache_data(ttl=600)
 def create_global_option_screener(options_df, live_price, risk_free_rate):
     if options_df.empty or live_price <= 0: return pd.DataFrame()
     
+    # Pre-filter to a manageable and relevant subset
     filtered_df = options_df[(options_df['dte'] >= 1) & (options_df['dte'] <= 90)].copy()
     strike_min, strike_max = live_price * 0.5, live_price * 1.5
     filtered_df = filtered_df[(filtered_df['strike'] > strike_min) & (filtered_df['strike'] < strike_max)]
@@ -169,7 +171,6 @@ def create_global_option_screener(options_df, live_price, risk_free_rate):
             if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta']) and ticker_data.get('mark_price', 0) > 0:
                 iv_raw = ticker_data['iv']
                 iv_decimal = iv_raw / 100.0 if iv_raw > 1.0 else iv_raw
-                
                 ttm = row['dte'] / 365.25
                 bs_model = BlackScholes(T=ttm, K=row['strike'], S=live_price, sigma=iv_decimal, r=risk_free_rate)
                 gamma_val = bs_model.calculate_gamma()
@@ -177,9 +178,9 @@ def create_global_option_screener(options_df, live_price, risk_free_rate):
                 theta_val = theta_call if row['option_type'] == 'call' else theta_put
 
                 enriched_options.append({
-                    'instrument': row['instrument_name'], 'expiry': row['expiry_str'], 'DTE': row['dte'], 'strike': row['strike'], 'type': row['option_type'],
-                    'premium': ticker_data['mark_price'], 'iv': iv_decimal, 'delta': ticker_data['delta'],
-                    'theta': theta_val, 'gamma': gamma_val,
+                    'instrument': row['instrument_name'], 'expiry': row['expiry_str'], 'DTE': row['dte'], 
+                    'strike': row['strike'], 'type': row['option_type'], 'premium': ticker_data['mark_price'], 
+                    'iv': iv_decimal, 'delta': ticker_data['delta'], 'theta': theta_val, 'gamma': gamma_val,
                 })
 
     if not enriched_options: return pd.DataFrame()
@@ -189,6 +190,14 @@ def create_global_option_screener(options_df, live_price, risk_free_rate):
     df['risk_adjusted_yield'] = df['annualized_yield'] * (1 - abs(df['delta']))
     df['theta_gamma_ratio'] = df['theta'].abs() / (df['gamma'] + 1e-9)
     df['cushion_%'] = abs(df['strike'] - live_price) / live_price * 100
+    
+    # --- HOLISTIC SCORE CALCULATION ---
+    df['yield_score'] = df['risk_adjusted_yield'].rank(pct=True) * 100
+    df['efficiency_score'] = df['theta_gamma_ratio'].rank(pct=True) * 100
+    df['safety_score'] = df['cushion_%'].rank(pct=True) * 100
+    
+    # Weighted average to find the best overall candidate
+    df['holistic_score'] = (df['yield_score'] * 0.4) + (df['efficiency_score'] * 0.4) + (df['safety_score'] * 0.2)
     
     return df
 
@@ -345,7 +354,7 @@ else:
 # =====================================================================================
 
 with st.expander("🌍 Global Actionable Option Chain"):
-    st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. The single best candidate in each table is highlighted.")
+    st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. The single **best candidate** (by Holistic Score) is highlighted.")
     df_enriched = create_global_option_screener(all_options, live_eth_price, RISK_FREE_RATE)
     
     if not df_enriched.empty:
@@ -357,42 +366,50 @@ with st.expander("🌍 Global Actionable Option Chain"):
             calls_global = df_filtered[df_filtered['type'] == 'call'].sort_values(by='risk_adjusted_yield', ascending=False)
             puts_global = df_filtered[df_filtered['type'] == 'put'].sort_values(by='risk_adjusted_yield', ascending=False)
 
-            cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%']
+            cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%', 'holistic_score']
             
-            # --- NEW FORMATTING LOGIC ---
+            # Use thousands for theta/gamma ratio for readability
             calls_global['theta_gamma_ratio'] /= 1000
             puts_global['theta_gamma_ratio'] /= 1000
-            style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.0f}K', 'cushion_%': '{:.1f}%'}
+            style_formats = {
+                'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 
+                'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.0f}K', 
+                'cushion_%': '{:.1f}%', 'holistic_score': '{:.1f}'
+            }
 
-            # --- NEW HIGHLIGHTING FUNCTION ---
-            def highlight_top_row(df):
-                # Create a blank DataFrame with the same shape to hold our styles
-                style_df = pd.DataFrame('', index=df.index, columns=df.columns)
-                # Get the index of the first row (the best one)
-                top_row_index = df.index[0]
-                # Apply the highlight style to that row
-                style_df.loc[top_row_index, :] = 'background-color: #004d00; color: white; border-bottom: 2px solid #FFFFFF;'
+            # --- HOLISTIC HIGHLIGHTING FUNCTION ---
+            def highlight_best_holistic(df_to_style):
+                style_df = pd.DataFrame('', index=df_to_style.index, columns=df_to_style.columns)
+                if not df_to_style.empty:
+                    best_row_index = df_to_style['holistic_score'].idxmax()
+                    style_df.loc[best_row_index, :] = 'background-color: #004d00; color: white; border: 2px solid #FFFFFF;'
                 return style_df
 
             st.subheader("Best Call Candidates (Sorted by Best Yield)")
             if not calls_global.empty:
-                styled_df = (calls_global[cols_to_display].head(20).style
-                             .format(style_formats)
-                             .background_gradient(subset=['risk_adjusted_yield'], cmap='Greens')
-                             .background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd')
-                             .apply(highlight_top_row, axis=None)) # axis=None applies the style DataFrame
-                st.dataframe(styled_df, use_container_width=True)
+                st.dataframe(
+                    calls_global[cols_to_display].head(20).style
+                    .format(style_formats)
+                    .background_gradient(subset=['risk_adjusted_yield'], cmap='Greens')
+                    .background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd')
+                    .background_gradient(subset=['cushion_%'], cmap='Blues')
+                    .apply(highlight_best_holistic, axis=None), 
+                    use_container_width=True
+                )
             else: 
                 st.info("No Call options met the criteria.")
 
             st.subheader("Best Put Candidates (Sorted by Best Yield)")
             if not puts_global.empty:
-                styled_df = (puts_global[cols_to_display].head(20).style
-                             .format(style_formats)
-                             .background_gradient(subset=['risk_adjusted_yield'], cmap='Greens')
-                             .background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd')
-                             .apply(highlight_top_row, axis=None)) # axis=None applies the style DataFrame
-                st.dataframe(styled_df, use_container_width=True)
+                st.dataframe(
+                    puts_global[cols_to_display].head(20).style
+                    .format(style_formats)
+                    .background_gradient(subset=['risk_adjusted_yield'], cmap='Greens')
+                    .background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd')
+                    .background_gradient(subset=['cushion_%'], cmap='Blues')
+                    .apply(highlight_best_holistic, axis=None), 
+                    use_container_width=True
+                )
             else: 
                 st.info("No Put options met the criteria.")
     else:
