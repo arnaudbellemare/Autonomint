@@ -93,14 +93,13 @@ def fetch_atm_iv(options_df: pd.DataFrame, target_dte: int, live_price: float) -
                 iv_float = float(iv_value)
                 normalized_iv = iv_float / 100.0 if iv_float > 1.0 else iv_float
                 if 0.05 < normalized_iv < 3.0: return normalized_iv
-                else: logging.warning(f"Normalized IV {normalized_iv:.2%} for {atm_call_instrument} is outside plausible range (5%-300%). Discarding."); return 0.0
-            except (ValueError, TypeError): logging.warning(f"Could not convert IV value '{iv_value}' to float for {atm_call_instrument}."); return 0.0
+            except (ValueError, TypeError): return 0.0
     return 0.0
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=3600)
 @with_retries()
-def fetch_historical_prices(symbol_pair: str = "ETH/USD", exchange_id: str = 'kraken', days_lookback: int = 50, timeframe='1d'):
-    exchange = getattr(ccxt, exchange_id)(); limit = days_lookback if timeframe == '1d' else days_lookback * 24 + 5
+def fetch_historical_prices(symbol_pair: str = "ETH/USD", exchange_id: str = 'kraken', days_lookback: int = 365, timeframe='1d'):
+    exchange = getattr(ccxt, exchange_id)(); limit = days_lookback + 5
     since = exchange.parse8601((datetime.now(timezone.utc) - timedelta(days=days_lookback)).isoformat())
     ohlcv = exchange.fetch_ohlcv(symbol_pair, timeframe=timeframe, since=since, limit=limit)
     if not ohlcv: return pd.DataFrame()
@@ -109,15 +108,31 @@ def fetch_historical_prices(symbol_pair: str = "ETH/USD", exchange_id: str = 'kr
 # =====================================================================================
 # ==                          CORE CALCULATIONS & METRICS                          ==
 # =====================================================================================
-def calculate_rv(prices: pd.Series, window: int = 30) -> float:
-    if len(prices) < window + 1: return 0.0
-    log_returns = np.log(prices / prices.shift(1)); return log_returns.rolling(window=window).std().iloc[-1] * np.sqrt(365)
-
 def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
     if len(prices) < period + 1: return 50.0
     delta = prices.diff(); gain = delta.where(delta > 0, 0); loss = -delta.where(delta < 0, 0); avg_gain = gain.ewm(com=period - 1, min_periods=period).mean(); avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
     if avg_loss.empty or avg_loss.iloc[-1] == 0: return 100.0
     rs = avg_gain.iloc[-1] / avg_loss.iloc[-1]; return 100 - (100 / (1 + rs))
+
+def calculate_volatility_rank(historical_prices: pd.DataFrame, window: int = 30) -> dict:
+    if historical_prices.empty or len(historical_prices) < 200:
+        return {'rank': 50, 'current': 0, 'min': 0, 'max': 0}
+    
+    log_returns = np.log(historical_prices['mark_price_close'] / historical_prices['mark_price_close'].shift(1))
+    historical_rv = log_returns.rolling(window=window).std() * np.sqrt(365)
+    historical_rv.dropna(inplace=True)
+    
+    if historical_rv.empty: return {'rank': 50, 'current': 0, 'min': 0, 'max': 0}
+        
+    current_vol = historical_rv.iloc[-1]
+    min_vol_1y = historical_rv.min()
+    max_vol_1y = historical_rv.max()
+    
+    if (max_vol_1y - min_vol_1y) == 0:
+        return {'rank': 50, 'current': current_vol, 'min': min_vol_1y, 'max': max_vol_1y}
+        
+    rank = (current_vol - min_vol_1y) / (max_vol_1y - min_vol_1y) * 100
+    return {'rank': rank, 'current': current_vol, 'min': min_vol_1y, 'max': max_vol_1y}
 
 def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp):
     underlying_pnl = (eth_price_final - params['eth_price_initial']) * params['eth_deposited']; aave_yield = params['eth_price_initial'] * params['eth_deposited'] * (params['aave_apy'] / 12)
@@ -134,57 +149,50 @@ def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with
 # =====================================================================================
 # ==                      STRATEGY ENGINE & DECISION LOGIC                       ==
 # =====================================================================================
-
-def determine_market_sentiment(iv, rv, rsi_daily, rsi_hourly, thresholds):
-    """
-    Determines the overall market sentiment based on RSI and volatility.
-    Returns a dictionary with 'sentiment', 'reason', and 'volatility_premium_exists'.
-    """
-    if iv <= 0:
-        return {'sentiment': 'NEUTRAL', 'reason': "ATM IV data is unavailable or invalid. Cannot assess market expectations.", 'volatility_premium_exists': False}
-
-    volatility_premium_exists = rv > 0 and iv >= rv * (1 + thresholds['min_iv_rv_premium'])
+def determine_market_sentiment(iv, vol_rank_data, rsi_daily, rsi_hourly, thresholds):
+    vol_rank = vol_rank_data['rank']
+    rv = vol_rank_data['current']
+    
+    is_vol_high_rank = vol_rank >= thresholds['min_vol_rank']
+    has_vol_premium = iv > 0 and rv > 0 and iv >= rv * (1 + thresholds['min_iv_rv_premium'])
 
     is_daily_bullish = rsi_daily > thresholds['rsi_overbought']
     is_daily_bearish = rsi_daily < thresholds['rsi_oversold']
     is_hourly_confirming_bullish = rsi_hourly > 50
     is_hourly_confirming_bearish = rsi_hourly < 50
 
-    if is_daily_bullish and is_hourly_confirming_bullish:
-        sentiment = 'BULLISH'
-        reason = (f"Strong bullish trend confirmed (Daily RSI: {rsi_daily:.1f}, Hourly: {rsi_hourly:.1f}). "
-                  "Selling Puts is the optimal strategy to collect premium while retaining full upside exposure to the rally.")
-    elif is_daily_bearish and is_hourly_confirming_bearish:
-        sentiment = 'BEARISH'
-        reason = (f"Strong bearish trend confirmed (Daily RSI: {rsi_daily:.1f}, Hourly: {rsi_hourly:.1f}). "
-                  "Selling Calls is the optimal strategy to generate income, partially hedging the downside risk of your spot ETH.")
-    else:
+    if not is_vol_high_rank:
         sentiment = 'NEUTRAL'
-        if volatility_premium_exists:
-            reason = (f"Market trend is neutral or conflicted (Daily RSI: {rsi_daily:.1f}). "
-                      "Selling a Strangle is optimal to maximize premium collection from a range-bound market.")
+        reason = f"Volatility Rank is currently {vol_rank:.0f}%, which is below the {thresholds['min_vol_rank']:.0f}% threshold. Premium selling is not attractive as volatility is historically low."
+        can_sell_options = False
+    elif not has_vol_premium:
+        sentiment = 'NEUTRAL'
+        reason = f"Implied Volatility ({iv:.1%}) is not sufficiently above Realized Volatility ({rv:.1%}). No statistical edge exists to justify selling options."
+        can_sell_options = False
+    else:
+        can_sell_options = True
+        if is_daily_bullish and is_hourly_confirming_bullish:
+            sentiment = 'BULLISH'
+            reason = f"Strong bullish trend confirmed (Daily RSI: {rsi_daily:.1f}) and Volatility Rank is high ({vol_rank:.0f}%). Selling Puts is optimal to collect historically rich premium while maintaining upside."
+        elif is_daily_bearish and is_hourly_confirming_bearish:
+            sentiment = 'BEARISH'
+            reason = f"Strong bearish trend confirmed (Daily RSI: {rsi_daily:.1f}) and Volatility Rank is high ({vol_rank:.0f}%). Selling Calls is optimal to generate income against the underlying position."
         else:
-            reason = (f"Implied Volatility ({iv:.1%}) is not sufficiently above Realized Volatility ({rv:.1%}). "
-                      "No statistical edge exists to sell options, so holding is the optimal action.")
+            sentiment = 'NEUTRAL'
+            reason = f"Market trend is neutral/conflicted, but Volatility Rank is high ({vol_rank:.0f}%). Selling a Strangle is optimal to harvest rich premium from time decay."
 
-    return {'sentiment': sentiment, 'reason': reason, 'volatility_premium_exists': volatility_premium_exists}
+    return {'sentiment': sentiment, 'reason': reason, 'can_sell_options': can_sell_options}
 
 def generate_optimal_strategy(market_sentiment_result):
-    """
-    Generates the optimal action based on the determined market sentiment and vol premium.
-    """
     sentiment = market_sentiment_result['sentiment']
-    vol_premium = market_sentiment_result['volatility_premium_exists']
+    can_sell = market_sentiment_result['can_sell_options']
     action = 'HOLD'
 
-    if vol_premium:
-        if sentiment == 'BULLISH':
-            action = 'SELL_PUT'
-        elif sentiment == 'BEARISH':
-            action = 'SELL_CALL'
-        elif sentiment == 'NEUTRAL':
-            action = 'SELL_STRANGLE'
-
+    if can_sell:
+        if sentiment == 'BULLISH': action = 'SELL_PUT'
+        elif sentiment == 'BEARISH': action = 'SELL_CALL'
+        elif sentiment == 'NEUTRAL': action = 'SELL_STRANGLE'
+            
     return {'action': action, 'sentiment': sentiment, 'reason': market_sentiment_result['reason']}
 
 def determine_perp_hedge_necessity(iv, rv, rsi_daily, daily_funding_rate, ltv, thresholds):
@@ -221,25 +229,39 @@ with st.sidebar:
     st.header("1. Core Position"); ETH_DEPOSITED = st.number_input("ETH Deposited", 1.0, 10.0, 2.0, 0.5); ETH_PRICE_INITIAL = st.number_input("Initial ETH Price ($)", 1000.0, 10000.0, 4254.0, 100.0); AAVE_APY = st.slider("AAVE Supply APY (%)", 0.1, 10.0, 3.0, 0.1) / 100.0; LTV = st.slider("Loan-to-Value (LTV) (%)", 50.0, 95.0, 80.0, 1.0) / 100.0
     st.header("2. dCDS Hedge Parameters"); DCDS_COVERAGE_PERCENT = st.slider("Downside Coverage (%)", 10., 50., 20., 1.)/ 100.0; DCDS_FEE_PERCENT = st.slider("Upfront Fee (% of hedged value)", 1., 20., 12., 0.5) / 100.0; DCDS_UPSIDE_SHARING_PERCENT = st.slider("Upside Sharing Cost (%)", 0., 10., 3., 0.5) / 100.0
     st.header("3. Option Execution Criteria"); TARGET_DTE = st.slider("Target Days to Expiry (DTE)", 7, 60, 30, 1); TARGET_DELTA = st.slider("Target Delta", 0.10, 0.45, 0.35, 0.01); MIN_PREMIUM_RATIO = st.slider("Min Premium-to-Spot Ratio (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
-    st.header("4. Strategy Engine Thresholds"); col1, col2 = st.columns(2)
+    st.header("4. Strategy Engine Thresholds");
+    MIN_VOL_RANK = st.slider("Min Volatility Rank to Sell Premium (%)", 0, 100, 50, help="Only sell options if the current volatility is above this percentile of its 1-year range.")
+    col1, col2 = st.columns(2)
     with col1: st.markdown("**Regime Definition**"); MIN_IV_RV_PREMIUM = col1.slider("Min IV > RV Edge (%)", 0, 20, 5, 1) / 100.0; RSI_OVERBOUGHT = col1.slider("Daily RSI Overbought", 60, 80, 70); RSI_OVERSOLD = col1.slider("Daily RSI Oversold", 20, 40, 30)
     with col2: st.markdown("**Perp Hedge Triggers**"); IV_HIGH = col2.slider("High IV Threshold (%)", 50., 120., 80., 1.) / 100.0; FUNDING_HIGH = col2.slider("High Daily Funding Rate (%)", 0.05, 0.3, 0.15) / 100.0; IV_RV_SPREAD = col2.slider("IV > RV by (%)", 5., 50., 25., 1.) / 100.0
-    thresholds = {'min_iv_rv_premium': MIN_IV_RV_PREMIUM, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'iv_rv_spread': IV_RV_SPREAD, 'ltv_high': 0.85, 'funding_rate_high': FUNDING_HIGH}
+    thresholds = {'min_iv_rv_premium': MIN_IV_RV_PREMIUM, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'iv_rv_spread': IV_RV_SPREAD, 'ltv_high': 0.85, 'funding_rate_high': FUNDING_HIGH, 'min_vol_rank': MIN_VOL_RANK}
     st.header("5. Manual Overrides"); perp_hedge_override = st.selectbox("Perpetual Hedge Strategy", ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"], help="Manually override the tactical perpetual hedge recommendation.")
 
 with st.spinner("Fetching all live market data..."):
     live_eth_price = fetch_live_eth_price()
     if live_eth_price is None: st.error("Could not fetch live ETH price. Please refresh."); st.stop()
-    daily_funding_rate = get_thalex_actual_daily_funding_rate('ETH'); all_options = get_all_options_data(); daily_historical_df = fetch_historical_prices(days_lookback=50, timeframe='1d'); hourly_historical_df = fetch_historical_prices(days_lookback=7, timeframe='1h')
-    if daily_funding_rate is None or daily_historical_df.empty or hourly_historical_df.empty or all_options.empty: st.error("Failed to fetch critical market data. Please refresh."); st.stop()
+    daily_funding_rate = get_thalex_actual_daily_funding_rate('ETH'); all_options = get_all_options_data(); 
+    yearly_historical_df = fetch_historical_prices(days_lookback=365)
+    hourly_historical_df = fetch_historical_prices(days_lookback=7, timeframe='1h')
+    if daily_funding_rate is None or yearly_historical_df.empty or hourly_historical_df.empty or all_options.empty: st.error("Failed to fetch critical market data. Please refresh."); st.stop()
 
-rv = calculate_rv(daily_historical_df['mark_price_close']); rsi_daily = calculate_rsi(daily_historical_df['mark_price_close']); rsi_hourly = calculate_rsi(hourly_historical_df['mark_price_close']); iv = fetch_atm_iv(all_options, TARGET_DTE, live_eth_price)
+vol_rank_data = calculate_volatility_rank(yearly_historical_df)
+rv = vol_rank_data['current']
+rsi_daily = calculate_rsi(yearly_historical_df['mark_price_close'])
+rsi_hourly = calculate_rsi(hourly_historical_df['mark_price_close'])
+iv = fetch_atm_iv(all_options, TARGET_DTE, live_eth_price)
 
 st.header("Live Market Dashboard")
-mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5); mcol1.metric("Live ETH Price", f"${live_eth_price:,.2f}"); mcol2.metric("30D Realized Volatility (RV)", f"{rv:.2%}"); iv_display_text = f"{iv:.2%}" if iv > 0 else "N/A"; mcol3.metric(f"~{TARGET_DTE}-Day ATM IV", iv_display_text); mcol4.metric("Daily RSI", f"{rsi_daily:.1f}"); mcol5.metric("Hourly RSI", f"{rsi_hourly:.1f}")
+mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
+mcol1.metric("Live ETH Price", f"${live_eth_price:,.2f}")
+mcol2.metric("30D Realized Volatility (RV)", f"{rv:.2%}")
+iv_display_text = f"{iv:.2%}" if iv > 0 else "N/A"
+mcol3.metric(f"~{TARGET_DTE}-Day ATM IV", iv_display_text, help="At-the-money Implied Volatility for the expiry closest to the target DTE.")
+mcol4.metric("1Y Volatility Rank", f"{vol_rank_data['rank']:.0f}%", help=f"Current 30D RV is at the {vol_rank_data['rank']:.0f} percentile of its 1-year range ({vol_rank_data['min']:.1%} - {vol_rank_data['max']:.1%})")
+mcol5.metric("Daily RSI", f"{rsi_daily:.1f}")
 
 st.header("Optimal Strategy Recommendation")
-market_sentiment_result = determine_market_sentiment(iv, rv, rsi_daily, rsi_hourly, thresholds)
+market_sentiment_result = determine_market_sentiment(iv, vol_rank_data, rsi_daily, rsi_hourly, thresholds)
 optimal_strategy = generate_optimal_strategy(market_sentiment_result)
 
 sentiment_color_map = {'BULLISH': 'green', 'BEARISH': 'red', 'NEUTRAL': 'orange'}; sentiment_icon_map = {'BULLISH': '🐂', 'BEARISH': '🐻', 'NEUTRAL': '⚖️'}
@@ -264,7 +286,7 @@ else: hedge_with_perp = False; hedge_reason = "Manual override: User forced no p
 
 st.subheader("Actionable Trade(s)")
 if optimal_strategy['action'] == 'HOLD': st.success("No compelling trade setup found. The optimal action is to hold the base position and wait.")
-elif not sold_put and not sold_call: st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ')}**, but no option was found that meets your specific Delta and Premium criteria.")
+elif optimal_strategy['action'] != 'HOLD' and not sold_put and not sold_call: st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ')}**, but no option was found that meets your specific Delta and Premium criteria.")
 else:
     if hedge_with_perp: st.success(f"**Tactical Action: Add a 1x Short Perpetual Hedge.**\n\n*Reasoning: {hedge_reason}*")
     else: st.info(f"**Tactical Action: No Perpetual Hedge Needed.**\n\n*Reasoning: {hedge_reason}*")
@@ -285,7 +307,7 @@ with pcol1:
 with pcol2:
     price_range = np.linspace(live_eth_price * 0.6, live_eth_price * 1.4, 200); pnl_values = [calculate_final_pnl(p, params, sold_put, sold_call, hedge_with_perp)[0] for p in price_range]
     fig = go.Figure(); fig.add_trace(go.Scatter(x=price_range, y=pnl_values, mode='lines', name='Total PnL', line=dict(color='royalblue', width=3))); fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="grey", annotation_text="Break-Even"); fig.add_vline(x=eth_price_final, line_width=2, line_dash="dot", line_color="orange", annotation_text=f"Target PnL: ${total_pnl:,.2f}", annotation_position="top right"); fig.add_vline(x=live_eth_price, line_width=1, line_dash="dot", line_color="grey", annotation_text="Initial Price", annotation_position="bottom right")
-    title_strategy = "Hold" if (optimal_strategy['action'] == 'HOLD' or (not sold_put and not sold_call)) else optimal_strategy['action'].replace('_', ' ').title()
+    title_strategy = "Hold" if (optimal_strategy['action'] == 'HOLD' or (optimal_strategy['action'] != 'HOLD' and not sold_put and not sold_call)) else optimal_strategy['action'].replace('_', ' ').title()
     title_hedge = ' + Perp Hedge' if hedge_with_perp else ''
     title = f"Payoff: dCDS + {title_strategy}{title_hedge}"; fig.update_layout(title=title, xaxis_title="ETH Price at Expiry ($)", yaxis_title="Overall Profit / Loss ($)", yaxis_tickprefix='$', margin=dict(l=40, r=40, t=50, b=40))
     st.plotly_chart(fig, use_container_width=True)
