@@ -9,6 +9,7 @@ import logging
 import time
 import ccxt
 import re
+import plotly.graph_objects as go
 
 # =====================================================================================
 # ==                      APP CONFIGURATION & STYLING                                ==
@@ -107,10 +108,6 @@ def _calculate_dte(expiry_str: str, current_date_utc: datetime) -> float | None:
 
 @st.cache_data(ttl=300)
 def get_clean_options_df():
-    """
-    Fetches all instruments, parses them correctly and defensively, and returns
-    a clean DataFrame with calculated DTE, or None if it fails.
-    """
     instruments = fetch_instruments()
     if not instruments:
         st.error("Failed to fetch market instruments.")
@@ -143,6 +140,74 @@ def get_clean_options_df():
     return pd.DataFrame(parsed_options)
 
 # =====================================================================================
+# ==                            PAYOFF VISUALIZATION                             ==
+# =====================================================================================
+
+def create_payoff_diagram(
+    strategy: str,
+    price_range: np.ndarray,
+    eth_deposited: float,
+    eth_price_initial: float,
+    aave_yield: float,
+    call_strike: float | None,
+    call_price: float | None,
+    put_strike: float | None,
+    put_price: float | None,
+    dcds_premium_rate: float | None,
+    predicted_price: float
+):
+    """Generates an interactive Plotly payoff diagram for the given strategy."""
+    collateral_value_initial = eth_deposited * eth_price_initial
+    # PnL from holding the underlying ETH
+    underlying_pnl = (price_range * eth_deposited) - collateral_value_initial
+    
+    # Calculate PnL based on the selected strategy
+    if strategy == "Bullish 🐂":
+        # PnL from the long call option
+        option_pnl = np.maximum(0, price_range - call_strike) - call_price
+        total_pnl = underlying_pnl + aave_yield + option_pnl
+        title_text = "Payoff: ETH Holdings + AAVE Yield + Long Call"
+    
+    elif strategy == "Bearish / Neutral 🐻":
+        # PnL from the long put option
+        option_pnl = np.maximum(0, put_strike - price_range) - put_price
+        # Payout from dCDS (using the app's formula)
+        dcds_payout = np.maximum(0, (eth_price_initial - price_range) * eth_deposited * (1 - dcds_premium_rate))
+        total_pnl = underlying_pnl + aave_yield + option_pnl + dcds_payout
+        title_text = "Payoff: ETH Holdings + AAVE Yield + Long Put + dCDS"
+    else:
+        return None
+
+    # Create the Plotly figure
+    fig = go.Figure()
+
+    # Add the main payoff trace
+    fig.add_trace(go.Scatter(
+        x=price_range, y=total_pnl, mode='lines', name='Total PnL', line=dict(color='royalblue', width=3)
+    ))
+
+    # Add a zero line for break-even reference
+    fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="grey", annotation_text="Break-Even")
+
+    # Add a vertical line for the user's predicted price
+    predicted_pnl_index = np.argmin(np.abs(price_range - predicted_price))
+    predicted_pnl = total_pnl[predicted_pnl_index]
+    fig.add_vline(x=predicted_price, line_width=2, line_dash="dot", line_color="orange",
+                  annotation_text=f"Predicted PnL: ${predicted_pnl:,.0f}",
+                  annotation_position="top right")
+
+    # Style the chart
+    fig.update_layout(
+        title=title_text,
+        xaxis_title="ETH Price at Expiry ($)",
+        yaxis_title="Overall Profit / Loss ($)",
+        yaxis_tickprefix='$',
+        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
+        margin=dict(l=40, r=40, t=50, b=40)
+    )
+    return fig
+
+# =====================================================================================
 # ==                          SIDEBAR FOR USER INPUTS                              ==
 # =====================================================================================
 
@@ -153,24 +218,20 @@ with st.sidebar:
 
     st.header("📈 Market & Hedging")
     expiry_choice = st.selectbox(
-        "Select Expiry Horizon",
-        ['30 Days', '60 Days', '90 Days'],
+        "Select Expiry Horizon", ['30 Days', '60 Days', '90 Days'],
         help="The app will find the closest available market expiry to your target."
     )
     TARGET_DTE = int(expiry_choice.split(' ')[0])
     
-    # --- FIX for sprintf errors: Use %% for literal percent signs in format strings ---
     AAVE_APY_PERCENT = st.slider("AAVE Supply APY", 0.0, 10.0, 3.0, format="%.2f%%")
     DCDS_PREMIUM_PERCENT = st.slider("dCDS Premium Rate", 0.0, 15.0, 5.0, format="%.2f%%")
-    # Convert to decimals for calculations
     AAVE_APY = AAVE_APY_PERCENT / 100.0
     DCDS_PREMIUM_RATE = DCDS_PREMIUM_PERCENT / 100.0
 
     st.header("🧠 Strategy Parameters")
-    # --- FIX for sprintf errors: Escape literal % in help text with a backslash ---
     vol_premium_percent = st.slider(
-        "IV Premium Threshold (\\%)", 1, 50, 10,
-        help="How much higher (in \\%) must IV be than RV to consider options 'expensive'?"
+        "IV Premium Threshold (%)", 1, 50, 10,
+        help="How much higher (in %) must IV be than RV to consider options 'expensive'?"
     )
     VOLATILITY_PREMIUM_THRESHOLD = 1 + (vol_premium_percent / 100.0)
     
@@ -189,12 +250,10 @@ def fetch_live_eth_price(exchange_id: str = 'kraken', symbol: str = 'ETH/USD'):
 # --- Step 1: Fetch all necessary data ---
 live_eth_price = fetch_live_eth_price()
 if not live_eth_price:
-    st.error("Could not fetch live ETH price. App cannot continue.")
-    st.stop()
+    st.error("Could not fetch live ETH price. App cannot continue."); st.stop()
     
 options_df = get_clean_options_df()
-if options_df is None:
-    st.stop()
+if options_df is None: st.stop()
     
 historical_df = fetch_historical_data()
 realized_vol = calculate_realized_volatility(historical_df['mark_price_close']) if not historical_df.empty else 0.0
@@ -203,25 +262,18 @@ realized_vol = calculate_realized_volatility(historical_df['mark_price_close']) 
 with st.spinner(f"Finding options for ~{TARGET_DTE} day expiry..."):
     best_expiry_dte = options_df.iloc[(options_df['dte'] - TARGET_DTE).abs().idxmin()]['dte']
     
-    # More robust check for reasonable expiry
-    if abs(best_expiry_dte - TARGET_DTE) > 20: # If closest expiry is >20 days off target
+    if abs(best_expiry_dte - TARGET_DTE) > 20:
         st.error(f"No suitable options found near {TARGET_DTE} days. Closest is ~{best_expiry_dte:.0f} days away.")
         st.stop()
 
     expiry_df = options_df[np.isclose(options_df['dte'], best_expiry_dte)].copy()
     st.info(f"Using options chain for expiry ~{best_expiry_dte:.0f} days from now.", icon="🗓️")
     
-    puts_df = expiry_df.loc[expiry_df['option_type'] == 'put']
-    calls_df = expiry_df.loc[expiry_df['option_type'] == 'call']
+    puts_df, calls_df = expiry_df[expiry_df['option_type'] == 'put'], expiry_df[expiry_df['option_type'] == 'call']
     
     best_put_row, best_call_row = None, None
-    # --- FIX for IndexError: Use .loc[] with the index label from .idxmin() ---
-    if not puts_df.empty:
-        best_put_idx = (puts_df['strike'] - live_eth_price).abs().idxmin()
-        best_put_row = puts_df.loc[best_put_idx]
-    if not calls_df.empty:
-        best_call_idx = (calls_df['strike'] - live_eth_price).abs().idxmin()
-        best_call_row = calls_df.loc[best_call_idx]
+    if not puts_df.empty: best_put_row = puts_df.loc[(puts_df['strike'] - live_eth_price).abs().idxmin()]
+    if not calls_df.empty: best_call_row = calls_df.loc[(calls_df['strike'] - live_eth_price).abs().idxmin()]
 
     put_price, put_iv, STRIKE_PRICE_PUT = None, None, None
     if best_put_row is not None:
@@ -239,10 +291,8 @@ with st.spinner(f"Finding options for ~{TARGET_DTE} day expiry..."):
             STRIKE_PRICE_CALL = best_call_row['strike']
             st.info(f"Selected closest CALL to live price: Strike ${STRIKE_PRICE_CALL:,.0f}", icon="🎯")
 
-# --- Guard clause for missing option prices ---
 if put_price is None or call_price is None:
-    st.error("Could not fetch valid option prices. The market may be illiquid. Please try again.")
-    st.stop()
+    st.error("Could not fetch valid option prices. The market may be illiquid. Please try again."); st.stop()
 
 # --- Step 3: Consolidate final data ---
 all_ivs = [iv for iv in [put_iv, call_iv] if iv]
@@ -285,8 +335,6 @@ strategy_name = "Bullish 🐂" if is_bullish_strategy else "Bearish / Neutral �
 
 st.info(f"**Recommended Strategy:** {strategy_name}", icon="💡")
 
-# --- FIX for sprintf error in metric delta ---
-# Using "%%" to escape the percent sign for the frontend rendering
 if strategy_name == "Bullish 🐂":
     st.markdown("**Action:** Re-leverage assets. Consider buying a Call option for upside.")
     abond_redeemed_eth = ETH_DEPOSITED + (aave_yield_monthly / eth_price_current if eth_price_current > 0 else 0)
@@ -308,6 +356,29 @@ else: # Bearish / Neutral Strategy
     pnl_col1.metric("Projected Profit", f"${profit:,.2f}", f"{apy:.2f}%% APY")
     pnl_col2.metric("dCDS Payout (net)", f"${dcds_payout:,.2f}")
     pnl_col3.metric("Put Option PnL", f"${put_pnl:,.2f}")
+
+# --- NEW: Payoff Diagram Visualization ---
+st.subheader("📈 Payoff Diagram at Expiry")
+price_range = np.linspace(eth_price_current * 0.4, eth_price_current * 1.6, num=200)
+
+payoff_fig = create_payoff_diagram(
+    strategy=strategy_name,
+    price_range=price_range,
+    eth_deposited=ETH_DEPOSITED,
+    eth_price_initial=ETH_PRICE_INITIAL,
+    aave_yield=aave_yield_monthly,
+    call_strike=STRIKE_PRICE_CALL,
+    call_price=call_price,
+    put_strike=STRIKE_PRICE_PUT,
+    put_price=put_price,
+    dcds_premium_rate=DCDS_PREMIUM_RATE,
+    predicted_price=eth_price_predicted
+)
+
+if payoff_fig:
+    st.plotly_chart(payoff_fig, use_container_width=True)
+else:
+    st.warning("Could not generate a payoff diagram for the selected strategy.")
 
 with st.expander("Show Underlying Volatility & Options Data"):
     st.write({
