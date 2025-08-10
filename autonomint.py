@@ -10,6 +10,7 @@ import time
 import ccxt
 import re
 import plotly.graph_objects as go
+from scipy.stats import norm
 
 # =====================================================================================
 # ==                            IMPORTS & CONFIGURATION                            ==
@@ -18,6 +19,40 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="Autonomint Quant Strategy Optimizer", page_icon="💡", layout="wide")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 BASE_URL_THALEX = "https://thalex.com/api/v2/public"
+
+# =====================================================================================
+# ==                        BLACK-SCHOLES GREEK CALCULATOR                         ==
+# =====================================================================================
+class BlackScholes:
+    def __init__(self, T, K, S, sigma, r):
+        self.T = max(T, 1e-9) # Time to maturity in years, avoid division by zero
+        self.K = float(K)     # Strike price
+        self.S = float(S)     # Spot price
+        self.sigma = float(sigma) # Implied volatility as a decimal
+        self.r = float(r)     # Risk-free rate as a decimal
+
+        self.sigma_sqrt_T = self.sigma * np.sqrt(self.T)
+        if self.sigma_sqrt_T < 1e-9:
+            self.d1 = np.inf if self.S > self.K else -np.inf
+            self.d2 = self.d1
+        else:
+            self.d1 = (np.log(self.S / self.K) + (self.r + 0.5 * self.sigma ** 2) * self.T) / self.sigma_sqrt_T
+            self.d2 = self.d1 - self.sigma_sqrt_T
+
+    def calculate_gamma(self):
+        if self.sigma_sqrt_T < 1e-9 or self.S < 1e-9: return 0.0
+        return norm.pdf(self.d1) / (self.S * self.sigma_sqrt_T)
+
+    def calculate_theta(self): # Returns daily theta in USD
+        if self.sigma_sqrt_T < 1e-9:
+            call_theta_val = -self.r * self.K * np.exp(-self.r*self.T) if self.S > self.K else 0.0
+            put_theta_val = self.r * self.K * np.exp(-self.r*self.T) if self.S < self.K else 0.0
+            return call_theta_val / 365.25, put_theta_val / 365.25
+        
+        term1_annual = - (self.S * norm.pdf(self.d1) * self.sigma) / (2 * np.sqrt(self.T))
+        call_theta_annual = term1_annual - self.r * self.K * np.exp(-self.r*self.T) * norm.cdf(self.d2)
+        put_theta_annual = term1_annual + self.r * self.K * np.exp(-self.r*self.T) * norm.cdf(-self.d2)
+        return call_theta_annual / 365.25, put_theta_annual / 365.25
 
 # =====================================================================================
 # ==                           DATA FETCHING & CACHING                           ==
@@ -124,9 +159,9 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
-# --- THIS IS THE CORRECTED, RESILIENT SCREENER FUNCTION ---
+# --- REFACTORED SCREENER USING THE BLACK-SCHOLES CLASS ---
 @st.cache_data(ttl=600)
-def create_global_option_screener(options_df, live_price):
+def create_global_option_screener(options_df, live_price, risk_free_rate):
     if options_df.empty or live_price <= 0: return pd.DataFrame()
     
     filtered_df = options_df[options_df['dte'] <= 90].copy()
@@ -136,17 +171,24 @@ def create_global_option_screener(options_df, live_price):
     if filtered_df.empty: return pd.DataFrame()
     
     enriched_options = []
-    with st.spinner(f"Fetching greeks for {len(filtered_df)} relevant options..."):
+    with st.spinner(f"Calculating greeks for {len(filtered_df)} relevant options..."):
         for _, row in filtered_df.iterrows():
             ticker_data = get_instrument_ticker(row['instrument_name'])
-            # RESILIENT CHECK: Only require essential data. Default non-essentials to 0.
+            # Only need essential data from API
             if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta']) and ticker_data.get('mark_price', 0) > 0:
+                # Calculate greeks ourselves for reliability
+                ttm = row['dte'] / 365.25
+                iv_decimal = ticker_data['iv'] / 100.0
+                bs_model = BlackScholes(T=ttm, K=row['strike'], S=live_price, sigma=iv_decimal, r=risk_free_rate)
+                
+                gamma_val = bs_model.calculate_gamma()
+                theta_call, theta_put = bs_model.calculate_theta()
+                theta_val = theta_call if row['option_type'] == 'call' else theta_put
+
                 enriched_options.append({
                     'instrument': row['instrument_name'], 'expiry': row['expiry_str'], 'DTE': row['dte'], 'strike': row['strike'], 'type': row['option_type'],
-                    'premium': ticker_data['mark_price'], 'iv': ticker_data.get('iv', 0) / 100.0,
-                    'delta': ticker_data.get('delta', np.nan),
-                    'theta': ticker_data.get('theta', 0.0), # Default to 0 if missing
-                    'gamma': ticker_data.get('gamma', 0.0), # Default to 0 if missing
+                    'premium': ticker_data['mark_price'], 'iv': iv_decimal, 'delta': ticker_data['delta'],
+                    'theta': theta_val, 'gamma': gamma_val,
                 })
 
     if not enriched_options: return pd.DataFrame()
@@ -238,6 +280,7 @@ with st.sidebar:
     st.header("4. Strategy Engine Thresholds")
     MIN_VOL_RANK = st.slider("Min Volatility Rank to Sell Premium (%)", 0, 100, 50, help="Only sell options if current volatility is above this percentile of its 1-year range.")
     MIN_VRP = st.slider("Minimum VRP to Trade (IV - RV)", 0.0, 15.0, 5.0, 0.5, format="%.1f%%", help="Minimum Volatility Risk Premium required to sell options.") / 100.0
+    RISK_FREE_RATE = st.slider("Risk-Free Rate (%)", 0.0, 10.0, 4.0, 0.1, help="Proxy for risk-free rate, used in Black-Scholes calculations (e.g., Aave USDC rate).") / 100.0
     Z_SCORE_WINDOW = st.slider("Z-Score Lookback Period (Days)", 30, 180, 90, help="The lookback window for the mean-reversion Price Z-Score.")
     RSI_OVERBOUGHT = st.slider("Daily RSI Overbought", 60, 80, 70); RSI_OVERSOLD = st.slider("Daily RSI Oversold", 20, 40, 30)
     st.header("5. Global Screener Filters")
@@ -308,7 +351,7 @@ else:
 
 with st.expander("🌍 Global Actionable Option Chain"):
     st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. It is sorted by **Risk-Adjusted Annualized Yield**.")
-    df_enriched = create_global_option_screener(all_options, live_eth_price)
+    df_enriched = create_global_option_screener(all_options, live_eth_price, RISK_FREE_RATE)
     
     if not df_enriched.empty:
         df_filtered = df_enriched[(df_enriched['delta'].abs() <= SCREENER_MAX_DELTA) & (df_enriched['premium'] >= (live_eth_price * SCREENER_MIN_PREMIUM_RATIO))].copy()
