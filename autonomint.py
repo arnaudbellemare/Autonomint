@@ -23,7 +23,7 @@ BASE_URL_THALEX = "https://thalex.com/api/v2/public"
 # =====================================================================================
 # ==                           DATA FETCHING & CACHING                           ==
 # =====================================================================================
-# (All data fetching functions remain unchanged)
+# (All data fetching and calculation functions are correct and remain unchanged)
 def with_retries(max_retries: int = 3, initial_delay: float = 1.0, backoff_factor: float = 2.0):
     def decorator(func):
         @wraps(func)
@@ -99,9 +99,6 @@ def fetch_historical_prices(symbol_pair: str = "ETH/USD", exchange_id: str = 'kr
     if not ohlcv: return pd.DataFrame()
     df = pd.DataFrame(ohlcv, columns=['date_time', 'open', 'high', 'low', 'mark_price_close', 'volume']); df['date_time'] = pd.to_datetime(df['date_time'], unit='ms', utc=True); return df
 
-# =====================================================================================
-# ==                          CORE CALCULATIONS & METRICS                          ==
-# =====================================================================================
 def calculate_rv(prices: pd.Series, window: int = 30) -> float:
     log_returns = np.log(prices / prices.shift(1)); return log_returns.rolling(window=window).std().iloc[-1] * np.sqrt(365)
 def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
@@ -120,23 +117,12 @@ def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with
     total_pnl = underlying_pnl + aave_yield + net_dcds_pnl + option_pnl + perp_pnl
     return total_pnl, underlying_pnl, aave_yield, net_dcds_pnl, option_pnl, perp_pnl
 
-# =====================================================================================
-# ==                      STRATEGY ENGINE & DECISION LOGIC                       ==
-# =====================================================================================
-
 def generate_optimal_strategy(iv, rv, rsi, thresholds):
-    """The Primary Engine: Determines the best high-level strategy for the current market regime."""
-    # 1. Check if there's any edge in selling premium at all.
-    if iv < rv * (1 + thresholds['min_iv_rv_premium']):
-        return {'action': 'HOLD', 'reason': f"IV ({iv:.1%}) is not sufficiently above RV ({rv:.1%}). No statistical edge in selling premium."}
-    
-    # 2. If there's an edge, determine the market trend.
-    if rsi > thresholds['rsi_bullish']:
-        return {'action': 'SELL_PUT', 'reason': f"Bullish trend detected (RSI: {rsi:.1f}). Selling puts captures premium while retaining upside."}
-    elif rsi < thresholds['rsi_bearish']:
-        return {'action': 'SELL_CALL', 'reason': f"Bearish trend detected (RSI: {rsi:.1f}). Selling calls generates income to hedge falling collateral value."}
-    else: # Neutral / Range-bound
-        return {'action': 'SELL_STRANGLE', 'reason': f"Neutral market (RSI: {rsi:.1f}). Selling a strangle maximizes premium collection from both sides."}
+    if rv > 0 and iv < rv * (1 + thresholds['min_iv_rv_premium']):
+        return {'action': 'HOLD', 'reason': f"IV ({iv:.1%}) is not sufficiently above RV ({rv:.1%}). No statistical edge."}
+    if rsi > thresholds['rsi_bullish']: return {'action': 'SELL_PUT', 'reason': f"Bullish trend (RSI: {rsi:.1f}). Sell puts to capture premium and retain upside."}
+    elif rsi < thresholds['rsi_bearish']: return {'action': 'SELL_CALL', 'reason': f"Bearish trend (RSI: {rsi:.1f}). Sell calls to hedge falling collateral."}
+    else: return {'action': 'SELL_STRANGLE', 'reason': f"Neutral market (RSI: {rsi:.1f}). Sell a strangle to maximize premium."}
 
 def determine_perp_hedge_necessity(iv, rv, rsi, daily_funding_rate, ltv, thresholds):
     reasons = [];
@@ -149,11 +135,11 @@ def determine_perp_hedge_necessity(iv, rv, rsi, daily_funding_rate, ltv, thresho
     return {'hedge_with_perp': False, 'reason': "Market conditions neutral. Tactical perp hedge not required."}
 
 def find_best_option_to_sell(options_df, option_type, target_delta, min_premium_ratio, live_price, target_dte):
-    # (This function remains unchanged, it's a solid micro-execution tool)
     if options_df.empty: return None
     options_df['dte_diff'] = (options_df['dte'] - target_dte).abs(); closest_dte = options_df.loc[options_df['dte_diff'].idxmin()]['dte']; target_expiry_options = options_df[np.isclose(options_df['dte'], closest_dte)].copy()
-    tickers = {row['instrument_name']: get_instrument_ticker(row['instrument_name']) for _, row in target_expiry_options.iterrows()}
-    target_expiry_options['ticker_data'] = target_expiry_options['instrument_name'].map(tickers)
+    with st.spinner(f"Scanning {len(target_expiry_options)} options..."):
+        tickers = {row['instrument_name']: get_instrument_ticker(row['instrument_name']) for _, row in target_expiry_options.iterrows()}
+        target_expiry_options['ticker_data'] = target_expiry_options['instrument_name'].map(tickers)
     target_expiry_options.dropna(subset=['ticker_data'], inplace=True); target_expiry_options['delta'] = target_expiry_options['ticker_data'].apply(lambda x: x.get('delta')); target_expiry_options['price'] = target_expiry_options['ticker_data'].apply(lambda x: x.get('mark_price')); target_expiry_options.dropna(subset=['delta', 'price'], inplace=True)
     candidates = target_expiry_options[target_expiry_options['option_type'] == option_type].copy()
     if live_price > 0: candidates = candidates[candidates['price'] / live_price >= min_premium_ratio]
@@ -166,27 +152,23 @@ def find_best_option_to_sell(options_df, option_type, target_delta, min_premium_
 # =====================================================================================
 
 st.title("Autonomint Quant Strategy Optimizer")
-# --- SIDEBAR ---
 with st.sidebar:
     st.header("1. Core Position"); ETH_DEPOSITED = st.number_input("ETH Deposited", 1.0, 10.0, 2.0, 0.5); ETH_PRICE_INITIAL = st.number_input("Initial ETH Price ($)", 1000.0, 10000.0, 2000.0, 100.0); AAVE_APY = st.slider("AAVE Supply APY (%)", 0.1, 10.0, 3.0, 0.1) / 100.0; LTV = st.slider("Loan-to-Value (LTV) (%)", 50.0, 95.0, 80.0, 1.0) / 100.0
     st.header("2. dCDS Hedge Parameters"); DCDS_COVERAGE_PERCENT = st.slider("Downside Coverage (%)", 10., 50., 20., 1.)/ 100.0; DCDS_FEE_PERCENT = st.slider("Upfront Fee (% of hedged value)", 1., 20., 12., 0.5) / 100.0; DCDS_UPSIDE_SHARING_PERCENT = st.slider("Upside Sharing Cost (%)", 0., 10., 3., 0.5) / 100.0
     st.header("3. Option Execution Criteria"); TARGET_DTE = st.slider("Target Days to Expiry (DTE)", 7, 60, 30, 1); TARGET_DELTA = st.slider("Target Delta", 0.10, 0.45, 0.35, 0.01); MIN_PREMIUM_RATIO = st.slider("Min Premium-to-Spot Ratio (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
     st.header("4. Strategy Engine Thresholds"); col1, col2 = st.columns(2)
-    with col1: st.markdown("**Regime Definition**"); MIN_IV_RV_PREMIUM = col1.slider("Min IV > RV Edge (%)", 0, 20, 5, 1, help="IV must be this much higher than RV to consider selling premium.") / 100.0; RSI_BULLISH = col1.slider("Bullish RSI Threshold", 50, 65, 55); RSI_BEARISH = col1.slider("Bearish RSI Threshold", 35, 50, 45)
+    with col1: st.markdown("**Regime Definition**"); MIN_IV_RV_PREMIUM = col1.slider("Min IV > RV Edge (%)", 0, 20, 5, 1) / 100.0; RSI_BULLISH = col1.slider("Bullish RSI Threshold", 50, 65, 55); RSI_BEARISH = col1.slider("Bearish RSI Threshold", 35, 50, 45)
     with col2: st.markdown("**Perp Hedge Triggers**"); IV_HIGH = col2.slider("High IV Threshold (%)", 50., 100., 80., 1.) / 100.0; FUNDING_HIGH = col2.slider("High Daily Funding Rate (%)", 0.05, 0.3, 0.15) / 100.0; IV_RV_SPREAD = col2.slider("IV > RV by (%)", 5., 50., 25., 1.) / 100.0
     thresholds = {'min_iv_rv_premium': MIN_IV_RV_PREMIUM, 'rsi_bullish': RSI_BULLISH, 'rsi_bearish': RSI_BEARISH, 'iv_high': IV_HIGH, 'iv_rv_spread': IV_RV_SPREAD, 'rsi_high': 70, 'rsi_low': 30, 'funding_rate_high': FUNDING_HIGH, 'ltv_high': 85}
 
-# --- MAIN APP BODY ---
-# 1. Data Loading & Prep
 with st.spinner("Fetching all live market data..."):
     live_eth_price = fetch_live_eth_price(); daily_funding_rate = get_thalex_actual_daily_funding_rate('ETH'); historical_df = fetch_historical_prices(days_lookback=40); all_options = get_all_options_data()
 if not live_eth_price or daily_funding_rate is None or historical_df.empty or all_options.empty: st.error("Failed to fetch critical market data."); st.stop()
 rv = calculate_rv(historical_df['mark_price_close']); rsi = calculate_rsi(historical_df['mark_price_close']); iv = fetch_atm_iv(all_options, TARGET_DTE, live_eth_price)
+if iv == 0.0: st.warning("Could not fetch a valid Implied Volatility.")
 
-# 2. Market Condition Display
 st.header("Live Market Dashboard"); mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5); mcol1.metric("Live ETH Price", f"${live_eth_price:,.2f}"); mcol2.metric("30D Realized Volatility (RV)", f"{rv:.2%}"); mcol3.metric(f"~{TARGET_DTE}-Day ATM IV", f"{iv:.2%}"); mcol4.metric("Daily Funding Rate", f"{daily_funding_rate:.4%}"); mcol5.metric("14D RSI", f"{rsi:.1f}")
 
-# 3. Strategy Generation and Execution
 st.header("Optimal Strategy Recommendation")
 optimal_strategy = generate_optimal_strategy(iv, rv, rsi, thresholds)
 st.info(f"**Optimal Strategy: {optimal_strategy['action'].replace('_', ' ').title()}**\n\n*Reasoning: {optimal_strategy['reason']}*", icon="💡")
@@ -197,22 +179,24 @@ with st.spinner("Searching for best options to execute strategy..."):
     elif optimal_strategy['action'] == 'SELL_CALL': sold_call = find_best_option_to_sell(all_options, 'call', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
     elif optimal_strategy['action'] == 'SELL_STRANGLE': sold_put = find_best_option_to_sell(all_options, 'put', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE); sold_call = find_best_option_to_sell(all_options, 'call', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
 
-# 4. Actionable Trade Display
 st.subheader("Actionable Trade(s)")
-if optimal_strategy['action'] == 'HOLD': st.success("No compelling trade setup found. The optimal action is to hold the base position and wait.")
-elif not sold_put and not sold_call: st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ')}**, but no option was found that meets your specific Delta and Premium criteria.")
+# --- THIS IS THE FIX: Initialize hedge_with_perp to a default value ---
+hedge_with_perp = False
+if optimal_strategy['action'] == 'HOLD':
+    st.success("No compelling trade setup found. The optimal action is to hold the base position and wait.")
+elif not sold_put and not sold_call:
+    st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ')}**, but no option was found that meets your specific Delta and Premium criteria.")
 else:
-    perp_decision = determine_perp_hedge_necessity(iv, rv, rsi, daily_funding_rate, LTV, thresholds); hedge_with_perp = perp_decision['hedge_with_perp']
+    perp_decision = determine_perp_hedge_necessity(iv, rv, rsi, daily_funding_rate, LTV, thresholds)
+    hedge_with_perp = perp_decision['hedge_with_perp'] # Re-assign the value based on the engine's decision
     if hedge_with_perp: st.success(f"**Tactical Action: Add a 1x Short Perpetual Hedge.**\n\n*Reasoning: {perp_decision['reason']}*")
     else: st.info(f"**Tactical Action: No Perpetual Hedge Needed.**\n\n*Reasoning: {perp_decision['reason']}*")
-    
     put_col, call_col = st.columns(2)
     with put_col:
         if sold_put: st.metric("Sell Put Strike", f"${sold_put['strike']:.0f}", f"Premium: ${sold_put['price']:.2f}")
     with call_col:
         if sold_call: st.metric("Sell Call Strike", f"${sold_call['strike']:.0f}", f"Premium: ${sold_call['price']:.2f}")
 
-# 5. PnL Payoff Analysis
 st.header("Position Payoff Analysis")
 params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': ETH_PRICE_INITIAL, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
 pcol1, pcol2 = st.columns([1,2])
