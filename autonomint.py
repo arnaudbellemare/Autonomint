@@ -26,16 +26,13 @@ def with_retries(max_retries: int = 3, initial_delay: float = 1.0, backoff_facto
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            delay = initial_delay
+            delay = initial_delay;
             for i in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
+                try: return func(*args, **kwargs)
                 except Exception as e:
                     logging.warning(f"API call to {func.__name__} failed (Attempt {i + 1}/{max_retries}): {e}. Retrying...")
-                    time.sleep(delay)
-                    delay *= backoff_factor
-            logging.error(f"API call to {func.__name__} failed after {max_retries} retries.")
-            return None
+                    time.sleep(delay); delay *= backoff_factor
+            logging.error(f"API call to {func.__name__} failed after {max_retries} retries."); return None
         return wrapper
     return decorator
 
@@ -99,7 +96,7 @@ def fetch_atm_iv(options_df: pd.DataFrame, target_dte: int, live_price: float) -
 @st.cache_data(ttl=3600)
 @with_retries()
 def fetch_historical_prices(symbol_pair: str = "ETH/USD", exchange_id: str = 'kraken', days_lookback: int = 365, timeframe='1d'):
-    exchange = getattr(ccxt, exchange_id)(); limit = days_lookback + 5
+    exchange = getattr(ccxt, exchange_id)(); limit = days_lookback + 50
     since = exchange.parse8601((datetime.now(timezone.utc) - timedelta(days=days_lookback)).isoformat())
     ohlcv = exchange.fetch_ohlcv(symbol_pair, timeframe=timeframe, since=since, limit=limit)
     if not ohlcv: return pd.DataFrame()
@@ -117,20 +114,12 @@ def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
 def calculate_volatility_rank(historical_prices: pd.DataFrame, window: int = 30) -> dict:
     if historical_prices.empty or len(historical_prices) < 200:
         return {'rank': 50, 'current': 0, 'min': 0, 'max': 0}
-    
     log_returns = np.log(historical_prices['mark_price_close'] / historical_prices['mark_price_close'].shift(1))
     historical_rv = log_returns.rolling(window=window).std() * np.sqrt(365)
     historical_rv.dropna(inplace=True)
-    
     if historical_rv.empty: return {'rank': 50, 'current': 0, 'min': 0, 'max': 0}
-        
-    current_vol = historical_rv.iloc[-1]
-    min_vol_1y = historical_rv.min()
-    max_vol_1y = historical_rv.max()
-    
-    if (max_vol_1y - min_vol_1y) == 0:
-        return {'rank': 50, 'current': current_vol, 'min': min_vol_1y, 'max': max_vol_1y}
-        
+    current_vol = historical_rv.iloc[-1]; min_vol_1y = historical_rv.min(); max_vol_1y = historical_rv.max()
+    if (max_vol_1y - min_vol_1y) == 0: return {'rank': 50, 'current': current_vol, 'min': min_vol_1y, 'max': max_vol_1y}
     rank = (current_vol - min_vol_1y) / (max_vol_1y - min_vol_1y) * 100
     return {'rank': rank, 'current': current_vol, 'min': min_vol_1y, 'max': max_vol_1y}
 
@@ -150,49 +139,35 @@ def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with
 # ==                      STRATEGY ENGINE & DECISION LOGIC                       ==
 # =====================================================================================
 def determine_market_sentiment(iv, vol_rank_data, rsi_daily, rsi_hourly, thresholds):
-    vol_rank = vol_rank_data['rank']
-    rv = vol_rank_data['current']
-    
-    is_vol_high_rank = vol_rank >= thresholds['min_vol_rank']
-    has_vol_premium = iv > 0 and rv > 0 and iv >= rv * (1 + thresholds['min_iv_rv_premium'])
-
-    is_daily_bullish = rsi_daily > thresholds['rsi_overbought']
-    is_daily_bearish = rsi_daily < thresholds['rsi_oversold']
-    is_hourly_confirming_bullish = rsi_hourly > 50
-    is_hourly_confirming_bearish = rsi_hourly < 50
+    vol_rank = vol_rank_data['rank']; rv = vol_rank_data['current']
+    is_vol_high_rank = vol_rank >= thresholds['min_vol_rank']; has_vol_premium = iv > 0 and rv > 0 and iv >= rv * (1 + thresholds['min_iv_rv_premium'])
+    is_daily_bullish = rsi_daily > thresholds['rsi_overbought']; is_daily_bearish = rsi_daily < thresholds['rsi_oversold']
+    is_hourly_confirming_bullish = rsi_hourly > 50; is_hourly_confirming_bearish = rsi_hourly < 50
 
     if not is_vol_high_rank:
-        sentiment = 'NEUTRAL'
-        reason = f"Volatility Rank is currently {vol_rank:.0f}%, which is below the {thresholds['min_vol_rank']:.0f}% threshold. Premium selling is not attractive as volatility is historically low."
-        can_sell_options = False
+        sentiment, reason, can_sell_options = 'NEUTRAL', f"Volatility Rank is {vol_rank:.0f}%, below the {thresholds['min_vol_rank']:.0f}% threshold. Premium selling is not attractive as volatility is historically low.", False
     elif not has_vol_premium:
-        sentiment = 'NEUTRAL'
-        reason = f"Implied Volatility ({iv:.1%}) is not sufficiently above Realized Volatility ({rv:.1%}). No statistical edge exists to justify selling options."
-        can_sell_options = False
+        sentiment, reason, can_sell_options = 'NEUTRAL', f"Implied Volatility ({iv:.1%}) is not sufficiently above Realized Volatility ({rv:.1%}). No statistical edge exists to justify selling options.", False
     else:
         can_sell_options = True
         if is_daily_bullish and is_hourly_confirming_bullish:
             sentiment = 'BULLISH'
-            reason = f"Strong bullish trend confirmed (Daily RSI: {rsi_daily:.1f}) and Volatility Rank is high ({vol_rank:.0f}%). Selling Puts is optimal to collect historically rich premium while maintaining upside."
+            reason = f"Confirmed Uptrend: Daily RSI ({rsi_daily:.1f}) is strong and confirmed by Hourly RSI (>50). With high Volatility Rank ({vol_rank:.0f}%), selling Puts is optimal to collect premium without capping upside."
         elif is_daily_bearish and is_hourly_confirming_bearish:
             sentiment = 'BEARISH'
-            reason = f"Strong bearish trend confirmed (Daily RSI: {rsi_daily:.1f}) and Volatility Rank is high ({vol_rank:.0f}%). Selling Calls is optimal to generate income against the underlying position."
+            reason = f"Confirmed Downtrend: Daily RSI ({rsi_daily:.1f}) is weak and confirmed by Hourly RSI (<50). With high Volatility Rank ({vol_rank:.0f}%), selling Calls is optimal to generate hedging income."
         else:
             sentiment = 'NEUTRAL'
-            reason = f"Market trend is neutral/conflicted, but Volatility Rank is high ({vol_rank:.0f}%). Selling a Strangle is optimal to harvest rich premium from time decay."
-
+            reason = f"Conflicted or Neutral Trend: Daily RSI ({rsi_daily:.1f}) and Hourly RSI ({rsi_hourly:.1f}) do not show a clear, confirmed trend. With high Volatility Rank ({vol_rank:.0f}%), a Strangle is optimal to harvest premium from range-bound action."
+            
     return {'sentiment': sentiment, 'reason': reason, 'can_sell_options': can_sell_options}
 
 def generate_optimal_strategy(market_sentiment_result):
-    sentiment = market_sentiment_result['sentiment']
-    can_sell = market_sentiment_result['can_sell_options']
-    action = 'HOLD'
-
+    sentiment = market_sentiment_result['sentiment']; can_sell = market_sentiment_result['can_sell_options']; action = 'HOLD'
     if can_sell:
         if sentiment == 'BULLISH': action = 'SELL_PUT'
         elif sentiment == 'BEARISH': action = 'SELL_CALL'
         elif sentiment == 'NEUTRAL': action = 'SELL_STRANGLE'
-            
     return {'action': action, 'sentiment': sentiment, 'reason': market_sentiment_result['reason']}
 
 def determine_perp_hedge_necessity(iv, rv, rsi_daily, daily_funding_rate, ltv, thresholds):
@@ -252,13 +227,16 @@ rsi_hourly = calculate_rsi(hourly_historical_df['mark_price_close'])
 iv = fetch_atm_iv(all_options, TARGET_DTE, live_eth_price)
 
 st.header("Live Market Dashboard")
-mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
-mcol1.metric("Live ETH Price", f"${live_eth_price:,.2f}")
-mcol2.metric("30D Realized Volatility (RV)", f"{rv:.2%}")
+row1_col1, row1_col2, row1_col3 = st.columns(3)
+row1_col1.metric("Live ETH Price", f"${live_eth_price:,.2f}")
+row1_col2.metric("30D Realized Volatility (RV)", f"{rv:.2%}")
 iv_display_text = f"{iv:.2%}" if iv > 0 else "N/A"
-mcol3.metric(f"~{TARGET_DTE}-Day ATM IV", iv_display_text, help="At-the-money Implied Volatility for the expiry closest to the target DTE.")
-mcol4.metric("1Y Volatility Rank", f"{vol_rank_data['rank']:.0f}%", help=f"Current 30D RV is at the {vol_rank_data['rank']:.0f} percentile of its 1-year range ({vol_rank_data['min']:.1%} - {vol_rank_data['max']:.1%})")
-mcol5.metric("Daily RSI", f"{rsi_daily:.1f}")
+row1_col3.metric(f"~{TARGET_DTE}-Day ATM IV", iv_display_text)
+
+row2_col1, row2_col2, row2_col3 = st.columns(3)
+row2_col1.metric("1Y Volatility Rank", f"{vol_rank_data['rank']:.0f}%", help=f"Current 30D RV is at the {vol_rank_data['rank']:.0f} percentile of its 1-year range ({vol_rank_data['min']:.1%} - {vol_rank_data['max']:.1%})")
+row2_col2.metric("Daily RSI", f"{rsi_daily:.1f}")
+row2_col3.metric("Hourly RSI", f"{rsi_hourly:.1f}")
 
 st.header("Optimal Strategy Recommendation")
 market_sentiment_result = determine_market_sentiment(iv, vol_rank_data, rsi_daily, rsi_hourly, thresholds)
