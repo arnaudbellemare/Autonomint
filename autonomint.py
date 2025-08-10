@@ -51,9 +51,7 @@ def get_instrument_ticker(instrument_name: str):
 @st.cache_data(ttl=300)
 def get_thalex_actual_daily_funding_rate(coin_symbol: str) -> float:
     instrument_name = f"{coin_symbol.upper()}-PERPETUAL"; ticker_data = get_instrument_ticker(instrument_name)
-    if ticker_data:
-        if pd.notna(ticker_data.get('average_funding_rate_24h')): return float(ticker_data['average_funding_rate_24h'])
-        elif pd.notna(ticker_data.get('funding_rate')): return float(ticker_data['funding_rate']) * 3
+    if ticker_data and pd.notna(ticker_data.get('funding_rate')): return float(ticker_data['funding_rate']) * 3
     return 0.0
 
 @st.cache_data(ttl=600)
@@ -126,7 +124,7 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
-# --- THIS IS THE NEW, ADVANCED SCREENER FUNCTION ---
+# --- THIS IS THE CORRECTED, RESILIENT SCREENER FUNCTION ---
 @st.cache_data(ttl=600)
 def create_global_option_screener(options_df, live_price):
     if options_df.empty or live_price <= 0: return pd.DataFrame()
@@ -141,11 +139,14 @@ def create_global_option_screener(options_df, live_price):
     with st.spinner(f"Fetching greeks for {len(filtered_df)} relevant options..."):
         for _, row in filtered_df.iterrows():
             ticker_data = get_instrument_ticker(row['instrument_name'])
-            if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta', 'theta', 'gamma']) and ticker_data.get('mark_price', 0) > 0:
+            # RESILIENT CHECK: Only require essential data. Default non-essentials to 0.
+            if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta']) and ticker_data.get('mark_price', 0) > 0:
                 enriched_options.append({
                     'instrument': row['instrument_name'], 'expiry': row['expiry_str'], 'DTE': row['dte'], 'strike': row['strike'], 'type': row['option_type'],
-                    'premium': ticker_data['mark_price'], 'iv': ticker_data['iv'] / 100, 'delta': ticker_data['delta'],
-                    'theta': ticker_data['theta'], 'gamma': ticker_data['gamma'],
+                    'premium': ticker_data['mark_price'], 'iv': ticker_data.get('iv', 0) / 100.0,
+                    'delta': ticker_data.get('delta', np.nan),
+                    'theta': ticker_data.get('theta', 0.0), # Default to 0 if missing
+                    'gamma': ticker_data.get('gamma', 0.0), # Default to 0 if missing
                 })
 
     if not enriched_options: return pd.DataFrame()
@@ -305,9 +306,8 @@ else:
     with call_col:
         if sold_call: st.metric("Sell Call Strike", f"${sold_call['strike']:.0f}", f"Premium: ${sold_call['price']:.2f}")
 
-# --- NEW GLOBAL OPTION SCREENER UI ---
 with st.expander("🌍 Global Actionable Option Chain"):
-    st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. It is sorted by **Risk-Adjusted Annualized Yield** to highlight the most profitable opportunities.")
+    st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. It is sorted by **Risk-Adjusted Annualized Yield**.")
     df_enriched = create_global_option_screener(all_options, live_eth_price)
     
     if not df_enriched.empty:
