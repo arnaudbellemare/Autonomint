@@ -71,7 +71,7 @@ def get_all_options_data():
                 expiry_dt = datetime.strptime(expiry_str, "%d%b%y").replace(hour=8, minute=0, tzinfo=timezone.utc)
                 if expiry_dt > now_utc:
                     dte = (expiry_dt - now_utc).total_seconds() / (24 * 3600)
-                    parsed_options.append({'instrument_name': instr['instrument_name'], 'strike': float(strike_str), 'option_type': 'call' if type_char == 'C' else 'put', 'dte': dte})
+                    parsed_options.append({'instrument_name': instr['instrument_name'], 'expiry_str': expiry_str, 'strike': float(strike_str), 'option_type': 'call' if type_char == 'C' else 'put', 'dte': dte})
             except (ValueError, TypeError): continue
     return pd.DataFrame(parsed_options)
 
@@ -83,14 +83,9 @@ def fetch_atm_iv(options_df: pd.DataFrame, target_dte: int, live_price: float) -
     if calls_df.empty: return 0.0
     calls_df['strike_diff'] = (calls_df['strike'] - live_price).abs(); atm_call_instrument = calls_df.loc[calls_df['strike_diff'].idxmin()]['instrument_name']
     ticker_data = get_instrument_ticker(atm_call_instrument)
-    if ticker_data:
-        iv_value = ticker_data.get('iv')
-        if iv_value is not None and pd.notna(iv_value):
-            try:
-                iv_float = float(iv_value)
-                normalized_iv = iv_float / 100.0 if iv_float > 1.0 else iv_float
-                if 0.05 < normalized_iv < 3.0: return normalized_iv
-            except (ValueError, TypeError): return 0.0
+    if ticker_data and pd.notna(ticker_data.get('iv')):
+        iv_float = float(ticker_data['iv'])
+        return iv_float / 100.0 if iv_float > 1.0 else iv_float
     return 0.0
 
 @st.cache_data(ttl=3600)
@@ -131,33 +126,37 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
+# --- THIS IS THE NEW, ADVANCED SCREENER FUNCTION ---
 @st.cache_data(ttl=600)
-def create_risk_adjusted_yield_table(options_df, live_price):
-    if options_df.empty or live_price <= 0: return pd.DataFrame(), pd.DataFrame()
+def create_global_option_screener(options_df, live_price):
+    if options_df.empty or live_price <= 0: return pd.DataFrame()
     
     filtered_df = options_df[options_df['dte'] <= 90].copy()
     strike_min, strike_max = live_price * 0.5, live_price * 1.5
     filtered_df = filtered_df[(filtered_df['strike'] > strike_min) & (filtered_df['strike'] < strike_max)]
 
-    if filtered_df.empty: return pd.DataFrame(), pd.DataFrame()
+    if filtered_df.empty: return pd.DataFrame()
     
     enriched_options = []
     with st.spinner(f"Fetching greeks for {len(filtered_df)} relevant options..."):
         for _, row in filtered_df.iterrows():
             ticker_data = get_instrument_ticker(row['instrument_name'])
-            if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'theta', 'gamma']) and ticker_data.get('mark_price', 0) > 0:
-                enriched_options.append({'Strike': row['strike'], 'DTE': row['dte'], 'Type': row['option_type'], 'Premium': ticker_data['mark_price'], 'Theta': ticker_data['theta'], 'Gamma': ticker_data['gamma'],})
+            if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta', 'theta', 'gamma']) and ticker_data.get('mark_price', 0) > 0:
+                enriched_options.append({
+                    'instrument': row['instrument_name'], 'expiry': row['expiry_str'], 'DTE': row['dte'], 'strike': row['strike'], 'type': row['option_type'],
+                    'premium': ticker_data['mark_price'], 'iv': ticker_data['iv'] / 100, 'delta': ticker_data['delta'],
+                    'theta': ticker_data['theta'], 'gamma': ticker_data['gamma'],
+                })
 
-    if not enriched_options: return pd.DataFrame(), pd.DataFrame()
+    if not enriched_options: return pd.DataFrame()
 
     df = pd.DataFrame(enriched_options)
-    df['Cushion %'] = abs(df['Strike'] - live_price) / live_price * 100
-    df['Premium Score'] = df['Premium'].rank(pct=True) * 100; df['Cushion Score'] = df['Cushion %'].rank(pct=True) * 100
-    df['Theta Score'] = df['Theta'].rank(pct=True) * 100; df['Gamma Score'] = (1 - df['Gamma'].rank(pct=True)) * 100
-    df['Risk-Adj Score'] = (df['Premium Score'] + df['Cushion Score'] + df['Theta Score'] + df['Gamma Score']) / 4
-    calls_df = df[df['Type'] == 'call'].sort_values(by='Risk-Adj Score', ascending=False)
-    puts_df = df[df['Type'] == 'put'].sort_values(by='Risk-Adj Score', ascending=False)
-    return calls_df, puts_df
+    df['annualized_yield'] = (df['premium'] / df['strike']) / (df['DTE'] / 365.25)
+    df['risk_adjusted_yield'] = df['annualized_yield'] * (1 - abs(df['delta']))
+    df['theta_gamma_ratio'] = df['theta'].abs() / (df['gamma'] + 1e-9)
+    df['cushion_%'] = abs(df['strike'] - live_price) / live_price * 100
+    
+    return df
 
 def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp):
     underlying_pnl = (eth_price_final - params['eth_price_initial']) * params['eth_deposited']; aave_yield = params['eth_price_initial'] * params['eth_deposited'] * (params['aave_apy'] / 12)
@@ -234,16 +233,19 @@ st.title("Autonomint Quant Strategy Optimizer")
 with st.sidebar:
     st.header("1. Core Position"); ETH_DEPOSITED = st.number_input("ETH Deposited", 1.0, 10.0, 2.0, 0.5); AAVE_APY = st.slider("AAVE Supply APY (%)", 0.1, 10.0, 3.0, 0.1) / 100.0; LTV = st.slider("Loan-to-Value (LTV) (%)", 50.0, 95.0, 80.0, 1.0) / 100.0
     st.header("2. dCDS Hedge Parameters"); DCDS_COVERAGE_PERCENT = st.slider("Downside Coverage (%)", 10., 50., 20., 1.)/ 100.0; DCDS_FEE_PERCENT = st.slider("Upfront Fee (% of hedged value)", 1., 20., 12., 0.5) / 100.0; DCDS_UPSIDE_SHARING_PERCENT = st.slider("Upside Sharing Cost (%)", 0., 10., 3., 0.5) / 100.0
-    st.header("3. Option Execution Criteria"); TARGET_DTE = st.slider("Target Days to Expiry (DTE)", 7, 60, 30, 1); TARGET_DELTA = st.slider("Target Delta", 0.10, 0.45, 0.35, 0.01); MIN_PREMIUM_RATIO = st.slider("Min Premium-to-Spot Ratio (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
+    st.header("3. Option Execution Criteria"); TARGET_DTE = st.slider("Target Days to Expiry (DTE)", 7, 60, 30, 1);
     st.header("4. Strategy Engine Thresholds")
     MIN_VOL_RANK = st.slider("Min Volatility Rank to Sell Premium (%)", 0, 100, 50, help="Only sell options if current volatility is above this percentile of its 1-year range.")
     MIN_VRP = st.slider("Minimum VRP to Trade (IV - RV)", 0.0, 15.0, 5.0, 0.5, format="%.1f%%", help="Minimum Volatility Risk Premium required to sell options.") / 100.0
     Z_SCORE_WINDOW = st.slider("Z-Score Lookback Period (Days)", 30, 180, 90, help="The lookback window for the mean-reversion Price Z-Score.")
     RSI_OVERBOUGHT = st.slider("Daily RSI Overbought", 60, 80, 70); RSI_OVERSOLD = st.slider("Daily RSI Oversold", 20, 40, 30)
-    st.header("5. Tactical Hedge Triggers")
+    st.header("5. Global Screener Filters")
+    SCREENER_MAX_DELTA = st.slider("Max Abs. Delta for Screener", 0.10, 0.50, 0.35, 0.01)
+    SCREENER_MIN_PREMIUM_RATIO = st.slider("Min Premium/Spot Ratio for Screener (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
+    st.header("6. Tactical Hedge Triggers")
     IV_HIGH = st.slider("High IV Threshold (%)", 50., 120., 80., 1.) / 100.0; FUNDING_HIGH = st.slider("High Daily Funding Rate (%)", 0.05, 0.3, 0.15) / 100.0;
     thresholds = {'min_vol_rank': MIN_VOL_RANK, 'min_vrp': MIN_VRP, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'funding_rate_high': FUNDING_HIGH, 'ltv_high': 0.85}
-    st.header("6. Manual Overrides"); perp_hedge_override = st.selectbox("Perpetual Hedge Strategy", ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"])
+    st.header("7. Manual Overrides"); perp_hedge_override = st.selectbox("Perpetual Hedge Strategy", ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"])
 
 with st.spinner("Fetching all live market data..."):
     live_eth_price = fetch_live_eth_price()
@@ -262,13 +264,13 @@ col1, col2 = st.columns(2)
 with col1:
     st.metric("Live ETH Price", f"${live_eth_price:,.2f}")
     st.metric("30D Realized Volatility (RV)", f"{rv:.2%}")
-    st.metric("1Y Volatility Rank", f"{vol_rank_data['rank']:.0f}%", help=f"Current 30D RV is at the {vol_rank_data['rank']:.0f} percentile of its 1-year range ({vol_rank_data['min']:.1%} - {vol_rank_data['max']:.1%})")
+    st.metric("1Y Volatility Rank", f"{vol_rank_data['rank']:.0f}%", help=f"Current RV is at the {vol_rank_data['rank']:.0f} percentile of its 1-year range ({vol_rank_data['min']:.1%} - {vol_rank_data['max']:.1%})")
 with col2:
     iv_display_text = f"{iv:.2%}" if iv > 0 else "N/A"
     st.metric(f"~{TARGET_DTE}-Day ATM IV", iv_display_text)
-    st.metric("Volatility Risk Premium (VRP)", f"{vrp:.2%}", delta="Edge to Sell" if vrp > 0 else "No Edge", help="VRP = IV - RV. A positive value indicates a potential statistical edge for option sellers.")
+    st.metric("Volatility Risk Premium (VRP)", f"{vrp:.2%}", delta="Edge to Sell" if vrp > 0 else "No Edge", help="VRP = IV - RV.")
     z_score_delta = "Below Trend" if price_z_score < 0 else "Above Trend"
-    st.metric(f"{Z_SCORE_WINDOW}-Day Price Z-Score", f"{price_z_score:.2f}", delta=z_score_delta, help="Measures how many standard deviations the current price is from its moving average.")
+    st.metric(f"{Z_SCORE_WINDOW}-Day Price Z-Score", f"{price_z_score:.2f}", delta=z_score_delta, help="Std. deviations from the mean log-price.")
 
 st.header("Optimal Strategy Recommendation")
 market_sentiment_result = determine_market_sentiment(iv, rv, vrp, vol_rank_data['rank'], rsi_daily, rsi_hourly, thresholds)
@@ -285,15 +287,15 @@ st.markdown(f"""
 
 sold_put, sold_call, hedge_with_perp, hedge_reason = None, None, False, ""
 if optimal_strategy['action'] != 'HOLD':
-    if optimal_strategy['action'] in ['SELL_PUT', 'SELL_STRANGLE']: sold_put = find_best_option_to_sell(all_options, 'put', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
-    if optimal_strategy['action'] in ['SELL_CALL', 'SELL_STRANGLE']: sold_call = find_best_option_to_sell(all_options, 'call', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
+    if optimal_strategy['action'] in ['SELL_PUT', 'SELL_STRANGLE']: sold_put = find_best_option_to_sell(all_options, 'put', SCREENER_MAX_DELTA, SCREENER_MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
+    if optimal_strategy['action'] in ['SELL_CALL', 'SELL_STRANGLE']: sold_call = find_best_option_to_sell(all_options, 'call', SCREENER_MAX_DELTA, SCREENER_MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
 if perp_hedge_override == "Automatic (Recommended)": perp_decision = determine_perp_hedge_necessity(iv, rv, rsi_daily, daily_funding_rate, LTV, thresholds); hedge_with_perp = perp_decision['hedge_with_perp']; hedge_reason = perp_decision['reason']
 elif perp_hedge_override == "Force Short Hedge": hedge_with_perp = True; hedge_reason = "Manual override: User forced a short perpetual hedge."
 else: hedge_with_perp = False; hedge_reason = "Manual override: User forced no perpetual hedge."
 
 st.subheader("Actionable Trade(s)")
 if optimal_strategy['action'] == 'HOLD': st.success("No compelling trade setup found. The optimal action is to hold the base position and wait.")
-elif optimal_strategy['action'] != 'HOLD' and not sold_put and not sold_call: st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ')}**, but no option was found that meets your specific Delta and Premium criteria.")
+elif optimal_strategy['action'] != 'HOLD' and not sold_put and not sold_call: st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ')}**, but no option was found that meets your specific criteria for the target DTE.")
 else:
     if hedge_with_perp: st.success(f"**Tactical Action: Add a 1x Short Perpetual Hedge.**\n\n*Reasoning: {hedge_reason}*")
     else: st.info(f"**Tactical Action: No Perpetual Hedge Needed.**\n\n*Reasoning: {hedge_reason}*")
@@ -303,19 +305,34 @@ else:
     with call_col:
         if sold_call: st.metric("Sell Call Strike", f"${sold_call['strike']:.0f}", f"Premium: ${sold_call['price']:.2f}")
 
-with st.expander("Show Global Option Screener (by Risk-Adjusted Yield)"):
-    calls_table, puts_table = create_risk_adjusted_yield_table(all_options, live_eth_price)
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Top Calls by Risk-Adj. Yield")
-        if not calls_table.empty:
-            st.dataframe(calls_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
-        else: st.warning("Could not fetch or process detailed data for Call options.")
-    with col2:
-        st.subheader("Top Puts by Risk-Adj. Yield")
-        if not puts_table.empty:
-            st.dataframe(puts_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
-        else: st.warning("Could not fetch or process detailed data for Put options.")
+# --- NEW GLOBAL OPTION SCREENER UI ---
+with st.expander("🌍 Global Actionable Option Chain"):
+    st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. It is sorted by **Risk-Adjusted Annualized Yield** to highlight the most profitable opportunities.")
+    df_enriched = create_global_option_screener(all_options, live_eth_price)
+    
+    if not df_enriched.empty:
+        df_filtered = df_enriched[(df_enriched['delta'].abs() <= SCREENER_MAX_DELTA) & (df_enriched['premium'] >= (live_eth_price * SCREENER_MIN_PREMIUM_RATIO))].copy()
+
+        if df_filtered.empty:
+            st.warning("No options across ANY expiry met the filtering criteria. This could indicate a very low volatility environment or tight criteria.")
+        else:
+            calls_global = df_filtered[df_filtered['type'] == 'call'].sort_values(by='risk_adjusted_yield', ascending=False)
+            puts_global = df_filtered[df_filtered['type'] == 'put'].sort_values(by='risk_adjusted_yield', ascending=False)
+
+            cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%']
+            style_formats = {'DTE': '{:.0f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:.2f}', 'cushion_%': '{:.1f}%'}
+            
+            st.subheader("Best Call Candidates (Sorted by Best Yield)")
+            if not calls_global.empty:
+                st.dataframe(calls_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['risk_adjusted_yield'], cmap='Greens'), use_container_width=True)
+            else: st.info("No Call options met the criteria.")
+
+            st.subheader("Best Put Candidates (Sorted by Best Yield)")
+            if not puts_global.empty:
+                st.dataframe(puts_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['risk_adjusted_yield'], cmap='Greens'), use_container_width=True)
+            else: st.info("No Put options met the criteria.")
+    else:
+        st.warning("Could not retrieve data for Global Actionable Chain analysis.")
 
 st.header("Position Payoff Analysis")
 params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': live_eth_price, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
