@@ -340,28 +340,33 @@ else:
         if sold_call: st.metric("Sell Call Strike", f"${sold_call['strike']:.0f}", f"Premium: ${sold_call['price']:.2f}")
 
 with st.expander("🌍 Global Actionable Option Chain"):
-    st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. The single **best candidate** (by Holistic Score) is highlighted.")
     df_enriched = create_global_option_screener(all_options, live_eth_price, RISK_FREE_RATE)
-    
     if not df_enriched.empty:
         df_filtered = df_enriched[(df_enriched['delta'].abs() <= SCREENER_MAX_DELTA) & (df_enriched['premium'] >= (live_eth_price * SCREENER_MIN_PREMIUM_RATIO))].copy()
-
         if df_filtered.empty:
             st.warning("No options across ANY expiry met the filtering criteria. This could indicate a very low volatility environment or tight criteria.")
         else:
             calls_global = df_filtered[df_filtered['type'] == 'call'].sort_values(by='holistic_score', ascending=False)
             puts_global = df_filtered[df_filtered['type'] == 'put'].sort_values(by='holistic_score', ascending=False)
+            
+            avg_call_score = calls_global['holistic_score'].mean() if not calls_global.empty else 0
+            avg_put_score = puts_global['holistic_score'].mean() if not puts_global.empty else 0
 
-            best_call_score = calls_global['holistic_score'].max() if not calls_global.empty else -1
-            best_put_score = puts_global['holistic_score'].max() if not puts_global.empty else -1
-
-            if best_put_score > best_call_score:
-                st.success(f"**Top Opportunity:** Analysis indicates that **selling Puts** currently offers a better risk-adjusted opportunity (Top Score: {best_put_score:.1f} vs. {best_call_score:.1f} for Calls).")
-            elif best_call_score > best_put_score:
-                st.success(f"**Top Opportunity:** Analysis indicates that **selling Calls** currently offers a better risk-adjusted opportunity (Top Score: {best_call_score:.1f} vs. {best_put_score:.1f} for Puts).")
-            else:
-                st.info("The risk-adjusted opportunities for selling Calls and Puts are currently balanced.")
-
+            st.subheader("Screener Verdict")
+            v_col1, v_col2, v_col3 = st.columns(3)
+            with v_col1:
+                st.metric("Avg. Call Score", f"{avg_call_score:.1f}", help="The average Holistic Score for all filtered Call options.")
+            with v_col2:
+                st.metric("Avg. Put Score", f"{avg_put_score:.1f}", help="The average Holistic Score for all filtered Put options.")
+            with v_col3:
+                if avg_put_score > avg_call_score:
+                    verdict_text = "Puts are Richer"
+                    delta_color = "normal"
+                else:
+                    verdict_text = "Calls are Richer"
+                    delta_color = "inverse"
+                st.metric("Market Skew Verdict", verdict_text, f"{abs(avg_put_score - avg_call_score):.1f} pts", delta_color=delta_color)
+            
             cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%', 'holistic_score']
             calls_global['theta_gamma_ratio'] /= 1000; puts_global['theta_gamma_ratio'] /= 1000
             style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.0f}K', 'cushion_%': '{:.1f}%', 'holistic_score': '{:.1f}'}
@@ -375,12 +380,12 @@ with st.expander("🌍 Global Actionable Option Chain"):
 
             st.subheader("Best Call Candidates (Sorted by Holistic Score)")
             if not calls_global.empty:
-                st.dataframe(calls_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['risk_adjusted_yield'], cmap='Greens').background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd').background_gradient(subset=['cushion_%'], cmap='Blues').apply(highlight_best_holistic, axis=None), use_container_width=True)
+                st.dataframe(calls_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['holistic_score'], cmap='magma').apply(highlight_best_holistic, axis=None), use_container_width=True)
             else: st.info("No Call options met the criteria.")
 
             st.subheader("Best Put Candidates (Sorted by Holistic Score)")
             if not puts_global.empty:
-                st.dataframe(puts_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['risk_adjusted_yield'], cmap='Greens').background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd').background_gradient(subset=['cushion_%'], cmap='Blues').apply(highlight_best_holistic, axis=None), use_container_width=True)
+                st.dataframe(puts_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['holistic_score'], cmap='magma').apply(highlight_best_holistic, axis=None), use_container_width=True)
             else: st.info("No Put options met the criteria.")
     else:
         st.warning("Could not retrieve data for Global Actionable Chain analysis.")
