@@ -152,7 +152,6 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
-# --- FINAL, HOLISTIC SCREENER FUNCTION ---
 @st.cache_data(ttl=600)
 def create_global_option_screener(options_df, live_price, risk_free_rate):
     if options_df.empty or live_price <= 0: return pd.DataFrame()
@@ -168,18 +167,13 @@ def create_global_option_screener(options_df, live_price, risk_free_rate):
         for _, row in filtered_df.iterrows():
             ticker_data = get_instrument_ticker(row['instrument_name'])
             if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta']) and ticker_data.get('mark_price', 0) > 0:
-                iv_raw = ticker_data['iv']
-                iv_decimal = iv_raw / 100.0 if iv_raw > 1.0 else iv_raw
+                iv_raw = ticker_data['iv']; iv_decimal = iv_raw / 100.0 if iv_raw > 1.0 else iv_raw
                 ttm = row['dte'] / 365.25
                 bs_model = BlackScholes(T=ttm, K=row['strike'], S=live_price, sigma=iv_decimal, r=risk_free_rate)
                 gamma_val = bs_model.calculate_gamma()
                 theta_call, theta_put = bs_model.calculate_theta()
                 theta_val = theta_call if row['option_type'] == 'call' else theta_put
-
-                enriched_options.append({
-                    'instrument': row['instrument_name'], 'expiry': row['expiry_str'], 'DTE': row['dte'], 'strike': row['strike'], 'type': row['option_type'],
-                    'premium': ticker_data['mark_price'], 'iv': iv_decimal, 'delta': ticker_data['delta'], 'theta': theta_val, 'gamma': gamma_val,
-                })
+                enriched_options.append({'instrument': row['instrument_name'], 'expiry': row['expiry_str'], 'DTE': row['dte'], 'strike': row['strike'], 'type': row['option_type'], 'premium': ticker_data['mark_price'], 'iv': iv_decimal, 'delta': ticker_data['delta'], 'theta': theta_val, 'gamma': gamma_val})
 
     if not enriched_options: return pd.DataFrame()
 
@@ -189,12 +183,10 @@ def create_global_option_screener(options_df, live_price, risk_free_rate):
     df['theta_gamma_ratio'] = df['theta'].abs() / (df['gamma'] + 1e-9)
     df['cushion_%'] = abs(df['strike'] - live_price) / live_price * 100
     
-    # --- 4-FACTOR HOLISTIC SCORE CALCULATION ---
     df['yield_score'] = df['risk_adjusted_yield'].rank(pct=True) * 100
     df['efficiency_score'] = df['theta_gamma_ratio'].rank(pct=True) * 100
     df['safety_score'] = df['cushion_%'].rank(pct=True) * 100
-    df['probability_score'] = (1 - df['delta'].abs().rank(pct=True)) * 100 # Invert delta rank
-    
+    df['probability_score'] = (1 - df['delta'].abs().rank(pct=True)) * 100
     df['holistic_score'] = (df['yield_score'] * 0.30) + (df['efficiency_score'] * 0.30) + (df['probability_score'] * 0.25) + (df['safety_score'] * 0.15)
     
     return df
@@ -353,13 +345,24 @@ with st.expander("🌍 Global Actionable Option Chain"):
     
     if not df_enriched.empty:
         df_filtered = df_enriched[(df_enriched['delta'].abs() <= SCREENER_MAX_DELTA) & (df_enriched['premium'] >= (live_eth_price * SCREENER_MIN_PREMIUM_RATIO))].copy()
+
         if df_filtered.empty:
             st.warning("No options across ANY expiry met the filtering criteria. This could indicate a very low volatility environment or tight criteria.")
         else:
             calls_global = df_filtered[df_filtered['type'] == 'call'].sort_values(by='holistic_score', ascending=False)
             puts_global = df_filtered[df_filtered['type'] == 'put'].sort_values(by='holistic_score', ascending=False)
+
+            best_call_score = calls_global['holistic_score'].max() if not calls_global.empty else -1
+            best_put_score = puts_global['holistic_score'].max() if not puts_global.empty else -1
+
+            if best_put_score > best_call_score:
+                st.success(f"**Top Opportunity:** Analysis indicates that **selling Puts** currently offers a better risk-adjusted opportunity (Top Score: {best_put_score:.1f} vs. {best_call_score:.1f} for Calls).")
+            elif best_call_score > best_put_score:
+                st.success(f"**Top Opportunity:** Analysis indicates that **selling Calls** currently offers a better risk-adjusted opportunity (Top Score: {best_call_score:.1f} vs. {best_put_score:.1f} for Puts).")
+            else:
+                st.info("The risk-adjusted opportunities for selling Calls and Puts are currently balanced.")
+
             cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%', 'holistic_score']
-            
             calls_global['theta_gamma_ratio'] /= 1000; puts_global['theta_gamma_ratio'] /= 1000
             style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.0f}K', 'cushion_%': '{:.1f}%', 'holistic_score': '{:.1f}'}
             
