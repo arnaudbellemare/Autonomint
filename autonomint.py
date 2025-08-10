@@ -41,19 +41,13 @@ def with_retries(max_retries: int = 3, initial_delay: float = 1.0, backoff_facto
 def fetch_live_eth_price(exchange_id: str = 'kraken', symbol: str = 'ETH/USD'):
     exchange = getattr(ccxt, exchange_id)(); ticker = exchange.fetch_ticker(symbol); return ticker.get('last')
 
-# --- NEW BULK DATA FETCHING FUNCTION ---
-@st.cache_data(ttl=60) # Cache for 1 minute
+@st.cache_data(ttl=60)
 @with_retries()
 def get_all_tickers_bulk():
-    """Fetches all tickers in a single API call to avoid rate limiting."""
-    URL_TICKERS = f"{BASE_URL_THALEX}/tickers"
-    response = requests.get(URL_TICKERS, params={"currency": "ETH"}, timeout=20)
-    response.raise_for_status()
-    all_tickers = response.json().get("result", [])
-    # Convert list of tickers into a dictionary for fast lookups
+    URL_TICKERS = f"{BASE_URL_THALEX}/tickers"; response = requests.get(URL_TICKERS, params={"currency": "ETH"}, timeout=20)
+    response.raise_for_status(); all_tickers = response.json().get("result", [])
     return {ticker['instrument_name']: ticker for ticker in all_tickers}
 
-# The single instrument function is still useful for ATM IV
 @st.cache_data(ttl=10)
 @with_retries()
 def get_instrument_ticker(instrument_name: str):
@@ -144,34 +138,22 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
-# --- REFACTORED FUNCTION USING BULK DATA ---
 @st.cache_data(ttl=60)
 def create_risk_adjusted_yield_table(options_df, live_price, all_tickers_data):
-    if options_df.empty or live_price <= 0 or not all_tickers_data:
-        return pd.DataFrame(), pd.DataFrame()
-
+    if options_df.empty or live_price <= 0 or not all_tickers_data: return pd.DataFrame(), pd.DataFrame()
     enriched_options = []
     for _, row in options_df.iterrows():
         ticker_data = all_tickers_data.get(row['instrument_name'])
         if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'theta', 'gamma']) and ticker_data.get('mark_price', 0) > 0:
-            enriched_options.append({
-                'Strike': row['strike'], 'DTE': row['dte'], 'Type': row['option_type'],
-                'Premium': ticker_data['mark_price'], 'Theta': ticker_data['theta'], 'Gamma': ticker_data['gamma'],
-            })
-
+            enriched_options.append({'Strike': row['strike'], 'DTE': row['dte'], 'Type': row['option_type'], 'Premium': ticker_data['mark_price'], 'Theta': ticker_data['theta'], 'Gamma': ticker_data['gamma'],})
     if not enriched_options: return pd.DataFrame(), pd.DataFrame()
-    
     df = pd.DataFrame(enriched_options)
     df['Cushion %'] = abs(df['Strike'] - live_price) / live_price * 100
-    df['Premium Score'] = df['Premium'].rank(pct=True) * 100
-    df['Cushion Score'] = df['Cushion %'].rank(pct=True) * 100
-    df['Theta Score'] = df['Theta'].rank(pct=True) * 100
-    df['Gamma Score'] = (1 - df['Gamma'].rank(pct=True)) * 100
+    df['Premium Score'] = df['Premium'].rank(pct=True) * 100; df['Cushion Score'] = df['Cushion %'].rank(pct=True) * 100
+    df['Theta Score'] = df['Theta'].rank(pct=True) * 100; df['Gamma Score'] = (1 - df['Gamma'].rank(pct=True)) * 100
     df['Risk-Adj Score'] = (df['Premium Score'] + df['Cushion Score'] + df['Theta Score'] + df['Gamma Score']) / 4
-    
     calls_df = df[df['Type'] == 'call'].sort_values(by='Risk-Adj Score', ascending=False)
     puts_df = df[df['Type'] == 'put'].sort_values(by='Risk-Adj Score', ascending=False)
-    
     return calls_df, puts_df
 
 def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp):
@@ -189,23 +171,48 @@ def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with
 # =====================================================================================
 # ==                      STRATEGY ENGINE & DECISION LOGIC                       ==
 # =====================================================================================
-def determine_market_sentiment(iv, rv, vrp, vol_rank, rsi_daily, rsi_hourly, thresholds):
-    is_vol_high_rank = vol_rank >= thresholds['min_vol_rank']; has_vrp = vrp >= thresholds['min_vrp']
+# --- NEW DYNAMIC THRESHOLD CALCULATION ---
+def calculate_dynamic_vol_threshold(base_threshold, vrp, min_vrp, rsi_daily):
+    adjustment = 0; reason_parts = []
+    
+    vrp_excess = vrp - min_vrp
+    if vrp_excess > 0:
+        vrp_adjustment = min(vrp_excess * 200, 20) # For every 1% VRP edge, reduce threshold by 2 points, capped at 20.
+        adjustment += vrp_adjustment
+        reason_parts.append(f"High VRP (+{vrp_adjustment:.0f} pts)")
+
+    rsi_distance_from_center = abs(rsi_daily - 50)
+    if rsi_distance_from_center >= 20: # Strong trend (RSI > 70 or < 30)
+        adjustment += 10
+        reason_parts.append(f"Strong Trend (+10 pts)")
+    else: # Choppy market
+        adjustment -= 10
+        reason_parts.append(f"Choppy Market (-10 pts)")
+        
+    dynamic_threshold = base_threshold - adjustment
+    final_threshold = max(20, min(dynamic_threshold, 80)) # Clamp between 20 and 80
+    reason = " | ".join(reason_parts) if reason_parts else "No adjustment"
+    
+    return final_threshold, reason
+
+def determine_market_sentiment(iv, rv, vrp, vol_rank, rsi_daily, rsi_hourly, thresholds, dynamic_vol_threshold):
+    has_vrp = vrp >= thresholds['min_vrp']
+    is_vol_high_rank = vol_rank >= dynamic_vol_threshold # Use dynamic threshold
     is_daily_bullish = rsi_daily > thresholds['rsi_overbought']; is_daily_bearish = rsi_daily < thresholds['rsi_oversold']
     is_hourly_confirming_bullish = rsi_hourly > 50; is_hourly_confirming_bearish = rsi_hourly < 50
 
     if not is_vol_high_rank:
-        sentiment, reason, can_sell = 'NEUTRAL', f"Volatility Rank is {vol_rank:.0f}%, below the {thresholds['min_vol_rank']:.0f}% threshold. Environment is not favorable for selling premium.", False
+        sentiment, reason, can_sell = 'NEUTRAL', f"Volatility Rank is {vol_rank:.0f}%, below the dynamic threshold of {dynamic_vol_threshold:.0f}%. Environment is not favorable.", False
     elif not has_vrp:
-        sentiment, reason, can_sell = 'NEUTRAL', f"The Volatility Risk Premium (VRP) is only {vrp:.1%}, below the {thresholds['min_vrp']:.1f}% threshold. There is not enough edge to sell options.", False
+        sentiment, reason, can_sell = 'NEUTRAL', f"The Volatility Risk Premium (VRP) is only {vrp:.1%}, below the {thresholds['min_vrp']:.1f}% threshold. Not enough edge.", False
     else:
         can_sell = True
         if is_daily_bullish and is_hourly_confirming_bullish:
-            sentiment = 'BULLISH'; reason = f"Confirmed Uptrend (Daily RSI: {rsi_daily:.1f}) + High Vol Rank ({vol_rank:.0f}%) + Positive VRP ({vrp:.1%}). Ideal conditions to sell Puts."
+            sentiment = 'BULLISH'; reason = f"Confirmed Uptrend (RSI: {rsi_daily:.1f}) + Favorable Volatility. Ideal for selling Puts."
         elif is_daily_bearish and is_hourly_confirming_bearish:
-            sentiment = 'BEARISH'; reason = f"Confirmed Downtrend (Daily RSI: {rsi_daily:.1f}) + High Vol Rank ({vol_rank:.0f}%) + Positive VRP ({vrp:.1%}). Ideal conditions to sell Calls for hedging."
+            sentiment = 'BEARISH'; reason = f"Confirmed Downtrend (RSI: {rsi_daily:.1f}) + Favorable Volatility. Ideal for selling Calls."
         else:
-            sentiment = 'NEUTRAL'; reason = f"Conflicted/Neutral Trend (RSI Daily/Hourly: {rsi_daily:.1f}/{rsi_hourly:.1f}) + High Vol Rank ({vol_rank:.0f}%) + Positive VRP ({vrp:.1%}). Favorable for a Strangle."
+            sentiment = 'NEUTRAL'; reason = f"Conflicted/Neutral Trend (RSI: {rsi_daily:.1f}) + Favorable Volatility. Ideal for a Strangle."
     return {'sentiment': sentiment, 'reason': reason, 'can_sell_options': can_sell}
 
 def generate_optimal_strategy(market_sentiment_result):
@@ -220,8 +227,8 @@ def determine_perp_hedge_necessity(iv, rv, rsi_daily, daily_funding_rate, ltv, t
     reasons = []; vrp = iv - rv
     if iv > thresholds['iv_high']: reasons.append(f"High IV ({iv:.1%})")
     if vrp > thresholds['min_vrp'] + 0.1: reasons.append(f"High VRP ({vrp:.1%})")
-    if rsi_daily > 75 or rsi_daily < 25: reasons.append(f"Extreme trend (Daily RSI:{rsi_daily:.1f})")
-    if abs(daily_funding_rate) > thresholds['funding_rate_high']: reasons.append(f"High daily funding ({daily_funding_rate:.4%})")
+    if rsi_daily > 75 or rsi_daily < 25: reasons.append(f"Extreme trend (RSI:{rsi_daily:.1f})")
+    if abs(daily_funding_rate) > thresholds['funding_rate_high']: reasons.append(f"High funding ({daily_funding_rate:.4%})")
     if ltv > thresholds['ltv_high']: reasons.append(f"High LTV ({ltv:.1%})")
     if reasons: return {'hedge_with_perp': True, 'reason': "Tactical hedge is a MUST. Trigger(s): " + " | ".join(reasons)}
     return {'hedge_with_perp': False, 'reason': "Market conditions neutral. Tactical perp hedge not required."}
@@ -251,21 +258,19 @@ with st.sidebar:
     st.header("2. dCDS Hedge Parameters"); DCDS_COVERAGE_PERCENT = st.slider("Downside Coverage (%)", 10., 50., 20., 1.)/ 100.0; DCDS_FEE_PERCENT = st.slider("Upfront Fee (% of hedged value)", 1., 20., 12., 0.5) / 100.0; DCDS_UPSIDE_SHARING_PERCENT = st.slider("Upside Sharing Cost (%)", 0., 10., 3., 0.5) / 100.0
     st.header("3. Option Execution Criteria"); TARGET_DTE = st.slider("Target Days to Expiry (DTE)", 7, 60, 30, 1); TARGET_DELTA = st.slider("Target Delta", 0.10, 0.45, 0.35, 0.01); MIN_PREMIUM_RATIO = st.slider("Min Premium-to-Spot Ratio (%)", 0.1, 5.0, 1.0, 0.1) / 100.0
     st.header("4. Strategy Engine Thresholds")
-    MIN_VOL_RANK = st.slider("Min Volatility Rank to Sell Premium (%)", 0, 100, 50, help="Only sell options if current volatility is above this percentile of its 1-year range.")
-    MIN_VRP = st.slider("Minimum VRP to Trade (IV - RV)", 0.0, 15.0, 5.0, 0.5, format="%.1f%%", help="Minimum Volatility Risk Premium required to sell options.") / 100.0
-    Z_SCORE_WINDOW = st.slider("Z-Score Lookback Period (Days)", 30, 180, 90, help="The lookback window for the mean-reversion Price Z-Score.")
+    BASE_VOL_RANK = st.slider("Base Volatility Rank Threshold (%)", 0, 100, 50, help="Your baseline for a 'high' volatility environment.")
+    MIN_VRP = st.slider("Minimum VRP to Trade (IV - RV)", 0.0, 15.0, 5.0, 0.5, format="%.1f%%", help="Minimum Volatility Risk Premium required.") / 100.0
+    Z_SCORE_WINDOW = st.slider("Z-Score Lookback Period (Days)", 30, 180, 90)
     RSI_OVERBOUGHT = st.slider("Daily RSI Overbought", 60, 80, 70); RSI_OVERSOLD = st.slider("Daily RSI Oversold", 20, 40, 30)
     st.header("5. Tactical Hedge Triggers")
     IV_HIGH = st.slider("High IV Threshold (%)", 50., 120., 80., 1.) / 100.0; FUNDING_HIGH = st.slider("High Daily Funding Rate (%)", 0.05, 0.3, 0.15) / 100.0;
-    thresholds = {'min_vol_rank': MIN_VOL_RANK, 'min_vrp': MIN_VRP, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'funding_rate_high': FUNDING_HIGH, 'ltv_high': 0.85}
+    thresholds = {'base_vol_rank': BASE_VOL_RANK, 'min_vrp': MIN_VRP, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'funding_rate_high': FUNDING_HIGH, 'ltv_high': 0.85}
     st.header("6. Manual Overrides"); perp_hedge_override = st.selectbox("Perpetual Hedge Strategy", ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"])
 
 with st.spinner("Fetching all live market data... This may take a moment."):
     live_eth_price = fetch_live_eth_price()
     if live_eth_price is None: st.error("Could not fetch live ETH price. Please refresh."); st.stop()
-    daily_funding_rate = get_thalex_actual_daily_funding_rate('ETH'); all_options = get_all_options_data()
-    # --- Perform the single bulk call for all ticker data ---
-    all_tickers_data = get_all_tickers_bulk()
+    daily_funding_rate = get_thalex_actual_daily_funding_rate('ETH'); all_options = get_all_options_data(); all_tickers_data = get_all_tickers_bulk()
     yearly_historical_df = fetch_historical_prices(days_lookback=365); hourly_historical_df = fetch_historical_prices(days_lookback=7, timeframe='1h')
     if daily_funding_rate is None or yearly_historical_df.empty or hourly_historical_df.empty or all_options.empty: st.error("Failed to fetch critical market data."); st.stop()
 
@@ -273,22 +278,25 @@ vol_rank_data = calculate_volatility_rank(yearly_historical_df); rv = vol_rank_d
 rsi_daily = calculate_rsi(yearly_historical_df['mark_price_close']); rsi_hourly = calculate_rsi(hourly_historical_df['mark_price_close'])
 iv = fetch_atm_iv(all_options, TARGET_DTE, live_eth_price)
 price_z_score = calculate_price_z_score(yearly_historical_df, Z_SCORE_WINDOW); vrp = iv - rv
+dynamic_vol_threshold, dynamic_reason = calculate_dynamic_vol_threshold(thresholds['base_vol_rank'], vrp, thresholds['min_vrp'], rsi_daily)
 
 st.header("Live Market Dashboard")
 col1, col2 = st.columns(2)
 with col1:
     st.metric("Live ETH Price", f"${live_eth_price:,.2f}")
     st.metric("30D Realized Volatility (RV)", f"{rv:.2%}")
-    st.metric("1Y Volatility Rank", f"{vol_rank_data['rank']:.0f}%", help=f"Current 30D RV is at the {vol_rank_data['rank']:.0f} percentile of its 1-year range ({vol_rank_data['min']:.1%} - {vol_rank_data['max']:.1%})")
+    st.metric("1Y Volatility Rank", f"{vol_rank_data['rank']:.0f}%", help=f"Current RV is at the {vol_rank_data['rank']:.0f} percentile of its 1-year range ({vol_rank_data['min']:.1%} - {vol_rank_data['max']:.1%})")
 with col2:
     iv_display_text = f"{iv:.2%}" if iv > 0 else "N/A"
     st.metric(f"~{TARGET_DTE}-Day ATM IV", iv_display_text)
-    st.metric("Volatility Risk Premium (VRP)", f"{vrp:.2%}", delta="Edge to Sell" if vrp > 0 else "No Edge", help="VRP = IV - RV. A positive value indicates a potential statistical edge for option sellers.")
+    st.metric("Volatility Risk Premium (VRP)", f"{vrp:.2%}", delta="Edge to Sell" if vrp > 0 else "No Edge", help="VRP = IV - RV.")
     z_score_delta = "Below Trend" if price_z_score < 0 else "Above Trend"
-    st.metric(f"{Z_SCORE_WINDOW}-Day Price Z-Score", f"{price_z_score:.2f}", delta=z_score_delta, help="Measures how many standard deviations the current price is from its moving average.")
+    st.metric(f"{Z_SCORE_WINDOW}-Day Price Z-Score", f"{price_z_score:.2f}", delta=z_score_delta, help="Std. deviations from the mean log-price.")
+
+st.info(f"**Dynamic Threshold Calculation:** Base ({thresholds['base_vol_rank']:.0f}%) → **Adjusted ({dynamic_vol_threshold:.0f}%)** | Reason: *{dynamic_reason}*", icon="⚙️")
 
 st.header("Optimal Strategy Recommendation")
-market_sentiment_result = determine_market_sentiment(iv, rv, vrp, vol_rank_data['rank'], rsi_daily, rsi_hourly, thresholds)
+market_sentiment_result = determine_market_sentiment(iv, rv, vrp, vol_rank_data['rank'], rsi_daily, rsi_hourly, thresholds, dynamic_vol_threshold)
 optimal_strategy = generate_optimal_strategy(market_sentiment_result)
 sentiment_color_map = {'BULLISH': 'green', 'BEARISH': 'red', 'NEUTRAL': 'orange'}; sentiment_icon_map = {'BULLISH': '🐂', 'BEARISH': '🐻', 'NEUTRAL': '⚖️'}
 color = sentiment_color_map[optimal_strategy['sentiment']]; icon = sentiment_icon_map[optimal_strategy['sentiment']]
@@ -321,24 +329,18 @@ else:
         if sold_call: st.metric("Sell Call Strike", f"${sold_call['strike']:.0f}", f"Premium: ${sold_call['price']:.2f}")
 
 with st.expander("Show Global Option Screener (by Risk-Adjusted Yield)"):
-    # Pass the bulk ticker data to the function
     calls_table, puts_table = create_risk_adjusted_yield_table(all_options, live_eth_price, all_tickers_data)
-    
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Top Calls by Risk-Adj. Yield")
-        # --- ADDED ROBUSTNESS CHECK ---
         if not calls_table.empty:
             st.dataframe(calls_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
-        else:
-            st.warning("Could not fetch or process detailed data for Call options.")
+        else: st.warning("Could not fetch or process detailed data for Call options.")
     with col2:
         st.subheader("Top Puts by Risk-Adj. Yield")
-        # --- ADDED ROBUSTNESS CHECK ---
         if not puts_table.empty:
             st.dataframe(puts_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
-        else:
-            st.warning("Could not fetch or process detailed data for Put options.")
+        else: st.warning("Could not fetch or process detailed data for Put options.")
 
 st.header("Position Payoff Analysis")
 params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': live_eth_price, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
@@ -347,7 +349,7 @@ with pcol1:
     price_slider_start = int(live_eth_price * 0.5); price_slider_end = int(live_eth_price * 1.5); eth_price_final = st.slider("Set Target ETH Price ($) for PnL Breakdown", price_slider_start, price_slider_end, int(live_eth_price))
     total_pnl, pnl_underlying, pnl_aave, pnl_dcds, pnl_option, pnl_perp = calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp)
     st.metric("Total Projected PnL at Target Price", f"${total_pnl:,.2f}")
-    with st.expander("Show PnL Contribution Breakdown"): st.metric("PnL from Underlying ETH", f"${pnl_underlying:,.2f}", delta_color="off"); st.metric("PnL from AAVE Yield", f"${pnl_aave:.2f}"); st.metric("PnL from dCDS (Net)", f"${pnl_dcds:,.2f}"); st.metric("PnL from Sold Options", f"${pnl_option:,.2f}"); st.metric("PnL from Perpetual Hedge", f"${pnl_perp:,.2f}")
+    with st.expander("Show PnL Contribution Breakdown"): st.metric("PnL from Underlying ETH", f"${pnl_underlying:,.2f}", delta_color="off"); st.metric("PnL from AAVE Yield", f"${pnl_aave:.2f}"); st.metric("PnL from dCDS (Net)", f"${pnl_dcds:,.2f}"); st.metric("PnL from Sold Options", f"${pnl_option:.2f}"); st.metric("PnL from Perpetual Hedge", f"${pnl_perp:.2f}")
 with pcol2:
     price_range = np.linspace(live_eth_price * 0.6, live_eth_price * 1.4, 200); pnl_values = [calculate_final_pnl(p, params, sold_put, sold_call, hedge_with_perp)[0] for p in price_range]
     fig = go.Figure(); fig.add_trace(go.Scatter(x=price_range, y=pnl_values, mode='lines', name='Total PnL', line=dict(color='royalblue', width=3))); fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="grey", annotation_text="Break-Even"); fig.add_vline(x=eth_price_final, line_width=2, line_dash="dot", line_color="orange", annotation_text=f"Target PnL: ${total_pnl:,.2f}", annotation_position="top right"); fig.add_vline(x=live_eth_price, line_width=1, line_dash="dot", line_color="grey", annotation_text="Initial Price", annotation_position="bottom right")
