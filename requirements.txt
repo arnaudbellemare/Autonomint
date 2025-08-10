@@ -18,4 +18,4 @@ requests
 # For creating interactive charts
 altair
 
-    
+plotly
