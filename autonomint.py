@@ -25,16 +25,10 @@ BASE_URL_THALEX = "https://thalex.com/api/v2/public"
 # =====================================================================================
 class BlackScholes:
     def __init__(self, T, K, S, sigma, r):
-        self.T = max(T, 1e-9) # Time to maturity in years, avoid division by zero
-        self.K = float(K)     # Strike price
-        self.S = float(S)     # Spot price
-        self.sigma = float(sigma) # Implied volatility as a decimal
-        self.r = float(r)     # Risk-free rate as a decimal
-
+        self.T = max(T, 1e-9); self.K = float(K); self.S = float(S); self.sigma = float(sigma); self.r = float(r)
         self.sigma_sqrt_T = self.sigma * np.sqrt(self.T)
         if self.sigma_sqrt_T < 1e-9:
-            self.d1 = np.inf if self.S > self.K else -np.inf
-            self.d2 = self.d1
+            self.d1 = np.inf if self.S > self.K else -np.inf; self.d2 = self.d1
         else:
             self.d1 = (np.log(self.S / self.K) + (self.r + 0.5 * self.sigma ** 2) * self.T) / self.sigma_sqrt_T
             self.d2 = self.d1 - self.sigma_sqrt_T
@@ -43,12 +37,11 @@ class BlackScholes:
         if self.sigma_sqrt_T < 1e-9 or self.S < 1e-9: return 0.0
         return norm.pdf(self.d1) / (self.S * self.sigma_sqrt_T)
 
-    def calculate_theta(self): # Returns daily theta in USD
+    def calculate_theta(self):
         if self.sigma_sqrt_T < 1e-9:
             call_theta_val = -self.r * self.K * np.exp(-self.r*self.T) if self.S > self.K else 0.0
             put_theta_val = self.r * self.K * np.exp(-self.r*self.T) if self.S < self.K else 0.0
             return call_theta_val / 365.25, put_theta_val / 365.25
-        
         term1_annual = - (self.S * norm.pdf(self.d1) * self.sigma) / (2 * np.sqrt(self.T))
         call_theta_annual = term1_annual - self.r * self.K * np.exp(-self.r*self.T) * norm.cdf(self.d2)
         put_theta_annual = term1_annual + self.r * self.K * np.exp(-self.r*self.T) * norm.cdf(-self.d2)
@@ -159,12 +152,12 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
-# --- REFACTORED SCREENER USING THE BLACK-SCHOLES CLASS ---
 @st.cache_data(ttl=600)
 def create_global_option_screener(options_df, live_price, risk_free_rate):
     if options_df.empty or live_price <= 0: return pd.DataFrame()
     
-    filtered_df = options_df[options_df['dte'] <= 90].copy()
+    # --- PROFESSIONAL PRE-FILTERING ---
+    filtered_df = options_df[(options_df['dte'] >= 1) & (options_df['dte'] <= 90)].copy()
     strike_min, strike_max = live_price * 0.5, live_price * 1.5
     filtered_df = filtered_df[(filtered_df['strike'] > strike_min) & (filtered_df['strike'] < strike_max)]
 
@@ -174,13 +167,10 @@ def create_global_option_screener(options_df, live_price, risk_free_rate):
     with st.spinner(f"Calculating greeks for {len(filtered_df)} relevant options..."):
         for _, row in filtered_df.iterrows():
             ticker_data = get_instrument_ticker(row['instrument_name'])
-            # Only need essential data from API
             if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta']) and ticker_data.get('mark_price', 0) > 0:
-                # Calculate greeks ourselves for reliability
                 ttm = row['dte'] / 365.25
                 iv_decimal = ticker_data['iv'] / 100.0
                 bs_model = BlackScholes(T=ttm, K=row['strike'], S=live_price, sigma=iv_decimal, r=risk_free_rate)
-                
                 gamma_val = bs_model.calculate_gamma()
                 theta_call, theta_put = bs_model.calculate_theta()
                 theta_val = theta_call if row['option_type'] == 'call' else theta_put
@@ -355,15 +345,13 @@ with st.expander("🌍 Global Actionable Option Chain"):
     
     if not df_enriched.empty:
         df_filtered = df_enriched[(df_enriched['delta'].abs() <= SCREENER_MAX_DELTA) & (df_enriched['premium'] >= (live_eth_price * SCREENER_MIN_PREMIUM_RATIO))].copy()
-
         if df_filtered.empty:
             st.warning("No options across ANY expiry met the filtering criteria. This could indicate a very low volatility environment or tight criteria.")
         else:
             calls_global = df_filtered[df_filtered['type'] == 'call'].sort_values(by='risk_adjusted_yield', ascending=False)
             puts_global = df_filtered[df_filtered['type'] == 'put'].sort_values(by='risk_adjusted_yield', ascending=False)
-
             cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%']
-            style_formats = {'DTE': '{:.0f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:.2f}', 'cushion_%': '{:.1f}%'}
+            style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:.2f}', 'cushion_%': '{:.1f}%'}
             
             st.subheader("Best Call Candidates (Sorted by Best Yield)")
             if not calls_global.empty:
