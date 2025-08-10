@@ -26,16 +26,13 @@ def with_retries(max_retries: int = 3, initial_delay: float = 1.0, backoff_facto
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            delay = initial_delay
+            delay = initial_delay;
             for i in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
+                try: return func(*args, **kwargs)
                 except Exception as e:
                     logging.warning(f"API call to {func.__name__} failed (Attempt {i + 1}/{max_retries}): {e}. Retrying...")
-                    time.sleep(delay)
-                    delay *= backoff_factor
-            logging.error(f"API call to {func.__name__} failed after {max_retries} retries.")
-            return None
+                    time.sleep(delay); delay *= backoff_factor
+            logging.error(f"API call to {func.__name__} failed after {max_retries} retries."); return None
         return wrapper
     return decorator
 
@@ -141,7 +138,7 @@ def create_risk_adjusted_yield_table(options_df, live_price):
     with st.spinner(f"Fetching greeks for all {len(options_df)} options... This may take a moment."):
         for _, row in options_df.iterrows():
             ticker_data = get_instrument_ticker(row['instrument_name'])
-            if ticker_data and all(k in ticker_data for k in ['mark_price', 'theta', 'gamma']) and ticker_data['mark_price'] > 0:
+            if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'theta', 'gamma']) and ticker_data['mark_price'] > 0:
                 enriched_options.append({'instrument_name': row['instrument_name'], 'Strike': row['strike'], 'DTE': row['dte'], 'Type': row['option_type'], 'Premium': ticker_data['mark_price'], 'Theta': ticker_data['theta'], 'Gamma': ticker_data['gamma'],})
     if not enriched_options: return pd.DataFrame(), pd.DataFrame()
     df = pd.DataFrame(enriched_options)
@@ -302,10 +299,16 @@ with st.expander("Show Global Option Screener (by Risk-Adjusted Yield)"):
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Top Calls by Risk-Adj. Yield")
-        st.dataframe(calls_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
+        if not calls_table.empty:
+            st.dataframe(calls_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
+        else:
+            st.warning("Could not fetch detailed data for Call options.")
     with col2:
         st.subheader("Top Puts by Risk-Adj. Yield")
-        st.dataframe(puts_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
+        if not puts_table.empty:
+            st.dataframe(puts_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
+        else:
+            st.warning("Could not fetch detailed data for Put options.")
 
 st.header("Position Payoff Analysis")
 params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': live_eth_price, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
