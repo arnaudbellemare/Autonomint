@@ -20,3 +20,4 @@ altair
 
 plotly
 scipy
+matplotlib
