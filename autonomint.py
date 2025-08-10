@@ -213,6 +213,13 @@ def find_best_option_to_sell(options_df, option_type, target_delta, min_premium_
 # =====================================================================================
 st.title("Autonomint Quant Strategy Optimizer")
 with st.sidebar:
+    # --- NEW FEATURE ---
+    st.header("5. Manual Overrides")
+    perp_hedge_override = st.selectbox(
+        "Perpetual Hedge Strategy",
+        ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"],
+        help="Manually override the tactical perpetual hedge recommendation. 'Force Short Hedge' can be used to collect positive funding rates."
+    ) 
     st.header("1. Core Position")
     ETH_DEPOSITED = st.number_input("ETH Deposited", 1.0, 10.0, 2.0, 0.5)
     ETH_PRICE_INITIAL = st.number_input("Initial ETH Price ($)", 1000.0, 10000.0, 2000.0, 100.0)
@@ -243,13 +250,6 @@ with st.sidebar:
         IV_RV_SPREAD = col2.slider("IV > RV by (%)", 5., 50., 25., 1.) / 100.0
     thresholds = {'min_iv_rv_premium': MIN_IV_RV_PREMIUM, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'iv_rv_spread': IV_RV_SPREAD, 'ltv_high': 85, 'funding_rate_high': FUNDING_HIGH}
 
-    # --- NEW FEATURE ---
-    st.header("5. Manual Overrides")
-    perp_hedge_override = st.selectbox(
-        "Perpetual Hedge Strategy",
-        ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"],
-        help="Manually override the tactical perpetual hedge recommendation. 'Force Short Hedge' can be used to collect positive funding rates."
-    )
 
 with st.spinner("Fetching all live market data..."):
     live_eth_price = fetch_live_eth_price()
