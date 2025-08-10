@@ -41,10 +41,23 @@ def with_retries(max_retries: int = 3, initial_delay: float = 1.0, backoff_facto
 def fetch_live_eth_price(exchange_id: str = 'kraken', symbol: str = 'ETH/USD'):
     exchange = getattr(ccxt, exchange_id)(); ticker = exchange.fetch_ticker(symbol); return ticker.get('last')
 
+# --- NEW BULK DATA FETCHING FUNCTION ---
+@st.cache_data(ttl=60) # Cache for 1 minute
+@with_retries()
+def get_all_tickers_bulk():
+    """Fetches all tickers in a single API call to avoid rate limiting."""
+    URL_TICKERS = f"{BASE_URL_THALEX}/tickers"
+    response = requests.get(URL_TICKERS, params={"currency": "ETH"}, timeout=20)
+    response.raise_for_status()
+    all_tickers = response.json().get("result", [])
+    # Convert list of tickers into a dictionary for fast lookups
+    return {ticker['instrument_name']: ticker for ticker in all_tickers}
+
+# The single instrument function is still useful for ATM IV
 @st.cache_data(ttl=10)
 @with_retries()
 def get_instrument_ticker(instrument_name: str):
-    URL_TICKER = f"{BASE_URL_THALEX}/ticker"; API_DELAY_TICKER = 0.2; time.sleep(API_DELAY_TICKER)
+    URL_TICKER = f"{BASE_URL_THALEX}/ticker"; API_DELAY_TICKER = 0.1; time.sleep(API_DELAY_TICKER)
     response = requests.get(URL_TICKER, params={"instrument_name": instrument_name}, timeout=15)
     response.raise_for_status(); return response.json().get("result", {})
 
@@ -131,23 +144,34 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
-@st.cache_data(ttl=600)
-def create_risk_adjusted_yield_table(options_df, live_price):
-    if options_df.empty or live_price <= 0: return pd.DataFrame(), pd.DataFrame()
+# --- REFACTORED FUNCTION USING BULK DATA ---
+@st.cache_data(ttl=60)
+def create_risk_adjusted_yield_table(options_df, live_price, all_tickers_data):
+    if options_df.empty or live_price <= 0 or not all_tickers_data:
+        return pd.DataFrame(), pd.DataFrame()
+
     enriched_options = []
-    with st.spinner(f"Fetching greeks for all {len(options_df)} options... This may take a moment."):
-        for _, row in options_df.iterrows():
-            ticker_data = get_instrument_ticker(row['instrument_name'])
-            if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'theta', 'gamma']) and ticker_data['mark_price'] > 0:
-                enriched_options.append({'instrument_name': row['instrument_name'], 'Strike': row['strike'], 'DTE': row['dte'], 'Type': row['option_type'], 'Premium': ticker_data['mark_price'], 'Theta': ticker_data['theta'], 'Gamma': ticker_data['gamma'],})
+    for _, row in options_df.iterrows():
+        ticker_data = all_tickers_data.get(row['instrument_name'])
+        if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'theta', 'gamma']) and ticker_data.get('mark_price', 0) > 0:
+            enriched_options.append({
+                'Strike': row['strike'], 'DTE': row['dte'], 'Type': row['option_type'],
+                'Premium': ticker_data['mark_price'], 'Theta': ticker_data['theta'], 'Gamma': ticker_data['gamma'],
+            })
+
     if not enriched_options: return pd.DataFrame(), pd.DataFrame()
+    
     df = pd.DataFrame(enriched_options)
     df['Cushion %'] = abs(df['Strike'] - live_price) / live_price * 100
-    df['Premium Score'] = df['Premium'].rank(pct=True) * 100; df['Cushion Score'] = df['Cushion %'].rank(pct=True) * 100
-    df['Theta Score'] = df['Theta'].rank(pct=True) * 100; df['Gamma Score'] = (1 - df['Gamma'].rank(pct=True)) * 100
+    df['Premium Score'] = df['Premium'].rank(pct=True) * 100
+    df['Cushion Score'] = df['Cushion %'].rank(pct=True) * 100
+    df['Theta Score'] = df['Theta'].rank(pct=True) * 100
+    df['Gamma Score'] = (1 - df['Gamma'].rank(pct=True)) * 100
     df['Risk-Adj Score'] = (df['Premium Score'] + df['Cushion Score'] + df['Theta Score'] + df['Gamma Score']) / 4
+    
     calls_df = df[df['Type'] == 'call'].sort_values(by='Risk-Adj Score', ascending=False)
     puts_df = df[df['Type'] == 'put'].sort_values(by='Risk-Adj Score', ascending=False)
+    
     return calls_df, puts_df
 
 def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp):
@@ -236,10 +260,12 @@ with st.sidebar:
     thresholds = {'min_vol_rank': MIN_VOL_RANK, 'min_vrp': MIN_VRP, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'funding_rate_high': FUNDING_HIGH, 'ltv_high': 0.85}
     st.header("6. Manual Overrides"); perp_hedge_override = st.selectbox("Perpetual Hedge Strategy", ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"])
 
-with st.spinner("Fetching all live market data..."):
+with st.spinner("Fetching all live market data... This may take a moment."):
     live_eth_price = fetch_live_eth_price()
     if live_eth_price is None: st.error("Could not fetch live ETH price. Please refresh."); st.stop()
     daily_funding_rate = get_thalex_actual_daily_funding_rate('ETH'); all_options = get_all_options_data()
+    # --- Perform the single bulk call for all ticker data ---
+    all_tickers_data = get_all_tickers_bulk()
     yearly_historical_df = fetch_historical_prices(days_lookback=365); hourly_historical_df = fetch_historical_prices(days_lookback=7, timeframe='1h')
     if daily_funding_rate is None or yearly_historical_df.empty or hourly_historical_df.empty or all_options.empty: st.error("Failed to fetch critical market data."); st.stop()
 
@@ -295,20 +321,24 @@ else:
         if sold_call: st.metric("Sell Call Strike", f"${sold_call['strike']:.0f}", f"Premium: ${sold_call['price']:.2f}")
 
 with st.expander("Show Global Option Screener (by Risk-Adjusted Yield)"):
-    calls_table, puts_table = create_risk_adjusted_yield_table(all_options, live_eth_price)
+    # Pass the bulk ticker data to the function
+    calls_table, puts_table = create_risk_adjusted_yield_table(all_options, live_eth_price, all_tickers_data)
+    
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Top Calls by Risk-Adj. Yield")
+        # --- ADDED ROBUSTNESS CHECK ---
         if not calls_table.empty:
             st.dataframe(calls_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
         else:
-            st.warning("Could not fetch detailed data for Call options.")
+            st.warning("Could not fetch or process detailed data for Call options.")
     with col2:
         st.subheader("Top Puts by Risk-Adj. Yield")
+        # --- ADDED ROBUSTNESS CHECK ---
         if not puts_table.empty:
             st.dataframe(puts_table[['Strike', 'DTE', 'Premium', 'Cushion %', 'Theta', 'Gamma', 'Risk-Adj Score']].head(15).style.format({'Strike': '{:,.0f}', 'DTE': '{:.0f}', 'Premium': '${:,.2f}', 'Cushion %': '{:.1f}%', 'Theta': '{:.3f}', 'Gamma': '{:.6f}', 'Risk-Adj Score': '{:.1f}'}))
         else:
-            st.warning("Could not fetch detailed data for Put options.")
+            st.warning("Could not fetch or process detailed data for Put options.")
 
 st.header("Position Payoff Analysis")
 params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': live_eth_price, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
