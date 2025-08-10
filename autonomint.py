@@ -138,22 +138,59 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
-@st.cache_data(ttl=60)
-def create_risk_adjusted_yield_table(options_df, live_price, all_tickers_data):
-    if options_df.empty or live_price <= 0 or not all_tickers_data: return pd.DataFrame(), pd.DataFrame()
+# --- THIS IS THE CORRECTED, ROBUST FUNCTION ---
+@st.cache_data(ttl=600)
+def create_risk_adjusted_yield_table(options_df, live_price):
+    """
+    Scans a pre-filtered subset of options to create a risk-adjusted yield table
+    without hitting API rate limits.
+    """
+    if options_df.empty or live_price <= 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # --- PRE-FILTERING TO AVOID RATE LIMITS ---
+    # 1. Filter for options with reasonable DTE
+    filtered_df = options_df[options_df['dte'] <= 90].copy()
+    # 2. Filter for options reasonably close to the money
+    strike_min = live_price * 0.5
+    strike_max = live_price * 1.5
+    filtered_df = filtered_df[(filtered_df['strike'] > strike_min) & (filtered_df['strike'] < strike_max)]
+
+    if filtered_df.empty:
+        logging.warning("No options matched the pre-filtering criteria for the screener.")
+        return pd.DataFrame(), pd.DataFrame()
+    
     enriched_options = []
-    for _, row in options_df.iterrows():
-        ticker_data = all_tickers_data.get(row['instrument_name'])
-        if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'theta', 'gamma']) and ticker_data.get('mark_price', 0) > 0:
-            enriched_options.append({'Strike': row['strike'], 'DTE': row['dte'], 'Type': row['option_type'], 'Premium': ticker_data['mark_price'], 'Theta': ticker_data['theta'], 'Gamma': ticker_data['gamma'],})
-    if not enriched_options: return pd.DataFrame(), pd.DataFrame()
+    # Now, loop through the much smaller, pre-filtered list
+    with st.spinner(f"Fetching greeks for {len(filtered_df)} relevant options..."):
+        for _, row in filtered_df.iterrows():
+            ticker_data = get_instrument_ticker(row['instrument_name'])
+            # Check for valid data for all required fields
+            if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'theta', 'gamma']) and ticker_data.get('mark_price', 0) > 0:
+                enriched_options.append({
+                    'Strike': row['strike'],
+                    'DTE': row['dte'],
+                    'Type': row['option_type'],
+                    'Premium': ticker_data['mark_price'],
+                    'Theta': ticker_data['theta'],
+                    'Gamma': ticker_data['gamma'],
+                })
+
+    if not enriched_options:
+        logging.warning("Failed to enrich any options after fetching ticker data.")
+        return pd.DataFrame(), pd.DataFrame()
+
     df = pd.DataFrame(enriched_options)
     df['Cushion %'] = abs(df['Strike'] - live_price) / live_price * 100
-    df['Premium Score'] = df['Premium'].rank(pct=True) * 100; df['Cushion Score'] = df['Cushion %'].rank(pct=True) * 100
-    df['Theta Score'] = df['Theta'].rank(pct=True) * 100; df['Gamma Score'] = (1 - df['Gamma'].rank(pct=True)) * 100
+    df['Premium Score'] = df['Premium'].rank(pct=True) * 100
+    df['Cushion Score'] = df['Cushion %'].rank(pct=True) * 100
+    df['Theta Score'] = df['Theta'].rank(pct=True) * 100
+    df['Gamma Score'] = (1 - df['Gamma'].rank(pct=True)) * 100 # Invert gamma score
     df['Risk-Adj Score'] = (df['Premium Score'] + df['Cushion Score'] + df['Theta Score'] + df['Gamma Score']) / 4
+    
     calls_df = df[df['Type'] == 'call'].sort_values(by='Risk-Adj Score', ascending=False)
     puts_df = df[df['Type'] == 'put'].sort_values(by='Risk-Adj Score', ascending=False)
+    
     return calls_df, puts_df
 
 def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp):
