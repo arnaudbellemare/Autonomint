@@ -340,33 +340,61 @@ else:
     with call_col:
         if sold_call: st.metric("Sell Call Strike", f"${sold_call['strike']:.0f}", f"Premium: ${sold_call['price']:.2f}")
 
+# =====================================================================================
+# ==                      CORRECTED UI SECTION WITH HIGHLIGHTING                     ==
+# =====================================================================================
+
 with st.expander("🌍 Global Actionable Option Chain"):
-    st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. It is sorted by **Risk-Adjusted Annualized Yield**.")
+    st.markdown("This chain scans all relevant expiries and is filtered by the criteria in the sidebar. The single best candidate in each table is highlighted.")
     df_enriched = create_global_option_screener(all_options, live_eth_price, RISK_FREE_RATE)
     
     if not df_enriched.empty:
         df_filtered = df_enriched[(df_enriched['delta'].abs() <= SCREENER_MAX_DELTA) & (df_enriched['premium'] >= (live_eth_price * SCREENER_MIN_PREMIUM_RATIO))].copy()
+
         if df_filtered.empty:
             st.warning("No options across ANY expiry met the filtering criteria. This could indicate a very low volatility environment or tight criteria.")
         else:
             calls_global = df_filtered[df_filtered['type'] == 'call'].sort_values(by='risk_adjusted_yield', ascending=False)
             puts_global = df_filtered[df_filtered['type'] == 'put'].sort_values(by='risk_adjusted_yield', ascending=False)
+
             cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%']
             
-            # --- CORRECTED FORMATTING LOGIC ---
-            style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.0f}K', 'cushion_%': '{:.1f}%'}
+            # --- NEW FORMATTING LOGIC ---
             calls_global['theta_gamma_ratio'] /= 1000
             puts_global['theta_gamma_ratio'] /= 1000
+            style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.0f}K', 'cushion_%': '{:.1f}%'}
+
+            # --- NEW HIGHLIGHTING FUNCTION ---
+            def highlight_top_row(df):
+                # Create a blank DataFrame with the same shape to hold our styles
+                style_df = pd.DataFrame('', index=df.index, columns=df.columns)
+                # Get the index of the first row (the best one)
+                top_row_index = df.index[0]
+                # Apply the highlight style to that row
+                style_df.loc[top_row_index, :] = 'background-color: #004d00; color: white; border-bottom: 2px solid #FFFFFF;'
+                return style_df
 
             st.subheader("Best Call Candidates (Sorted by Best Yield)")
             if not calls_global.empty:
-                st.dataframe(calls_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['risk_adjusted_yield'], cmap='Greens').background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd'), use_container_width=True)
-            else: st.info("No Call options met the criteria.")
+                styled_df = (calls_global[cols_to_display].head(20).style
+                             .format(style_formats)
+                             .background_gradient(subset=['risk_adjusted_yield'], cmap='Greens')
+                             .background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd')
+                             .apply(highlight_top_row, axis=None)) # axis=None applies the style DataFrame
+                st.dataframe(styled_df, use_container_width=True)
+            else: 
+                st.info("No Call options met the criteria.")
 
             st.subheader("Best Put Candidates (Sorted by Best Yield)")
             if not puts_global.empty:
-                st.dataframe(puts_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['risk_adjusted_yield'], cmap='Greens').background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd'), use_container_width=True)
-            else: st.info("No Put options met the criteria.")
+                styled_df = (puts_global[cols_to_display].head(20).style
+                             .format(style_formats)
+                             .background_gradient(subset=['risk_adjusted_yield'], cmap='Greens')
+                             .background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd')
+                             .apply(highlight_top_row, axis=None)) # axis=None applies the style DataFrame
+                st.dataframe(styled_df, use_container_width=True)
+            else: 
+                st.info("No Put options met the criteria.")
     else:
         st.warning("Could not retrieve data for Global Actionable Chain analysis.")
 
