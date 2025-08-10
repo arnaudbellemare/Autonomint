@@ -152,6 +152,7 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
+# --- THIS IS THE FINAL, CORRECTED SCREENER FUNCTION ---
 @st.cache_data(ttl=600)
 def create_global_option_screener(options_df, live_price, risk_free_rate):
     if options_df.empty or live_price <= 0: return pd.DataFrame()
@@ -167,7 +168,11 @@ def create_global_option_screener(options_df, live_price, risk_free_rate):
         for _, row in filtered_df.iterrows():
             ticker_data = get_instrument_ticker(row['instrument_name'])
             if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta']) and ticker_data.get('mark_price', 0) > 0:
-                ttm = row['dte'] / 365.25; iv_decimal = ticker_data['iv'] / 100.0
+                # --- DEFINITIVE IV FIX ---
+                iv_raw = ticker_data.get('iv', 0)
+                iv_decimal = iv_raw / 100.0 if iv_raw > 1.0 else iv_raw
+                
+                ttm = row['dte'] / 365.25
                 bs_model = BlackScholes(T=ttm, K=row['strike'], S=live_price, sigma=iv_decimal, r=risk_free_rate)
                 gamma_val = bs_model.calculate_gamma()
                 theta_call, theta_put = bs_model.calculate_theta()
@@ -343,30 +348,26 @@ with st.expander("🌍 Global Actionable Option Chain"):
     
     if not df_enriched.empty:
         df_filtered = df_enriched[(df_enriched['delta'].abs() <= SCREENER_MAX_DELTA) & (df_enriched['premium'] >= (live_eth_price * SCREENER_MIN_PREMIUM_RATIO))].copy()
-
         if df_filtered.empty:
             st.warning("No options across ANY expiry met the filtering criteria. This could indicate a very low volatility environment or tight criteria.")
         else:
             calls_global = df_filtered[df_filtered['type'] == 'call'].sort_values(by='risk_adjusted_yield', ascending=False)
             puts_global = df_filtered[df_filtered['type'] == 'put'].sort_values(by='risk_adjusted_yield', ascending=False)
-
             cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%']
-            style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.2f}', 'cushion_%': '{:.1f}%'}
+            style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.2f}M', 'cushion_%': '{:.1f}%'}
             
+            # --- NEW FORMATTING FOR THETA/GAMMA RATIO ---
+            calls_global['theta_gamma_ratio'] /= 1_000_000
+            puts_global['theta_gamma_ratio'] /= 1_000_000
+
             st.subheader("Best Call Candidates (Sorted by Best Yield)")
             if not calls_global.empty:
-                st.dataframe(calls_global[cols_to_display].head(20).style.format(style_formats)
-                             .background_gradient(subset=['risk_adjusted_yield'], cmap='Greens')
-                             .background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd'), # <<< VISUALIZATION ADDED
-                             use_container_width=True)
+                st.dataframe(calls_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['risk_adjusted_yield'], cmap='Greens').background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd'), use_container_width=True)
             else: st.info("No Call options met the criteria.")
 
             st.subheader("Best Put Candidates (Sorted by Best Yield)")
             if not puts_global.empty:
-                st.dataframe(puts_global[cols_to_display].head(20).style.format(style_formats)
-                             .background_gradient(subset=['risk_adjusted_yield'], cmap='Greens')
-                             .background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd'), # <<< VISUALIZATION ADDED
-                             use_container_width=True)
+                st.dataframe(puts_global[cols_to_display].head(20).style.format(style_formats).background_gradient(subset=['risk_adjusted_yield'], cmap='Greens').background_gradient(subset=['theta_gamma_ratio'], cmap='YlOrRd'), use_container_width=True)
             else: st.info("No Put options met the criteria.")
     else:
         st.warning("Could not retrieve data for Global Actionable Chain analysis.")
