@@ -152,7 +152,6 @@ def calculate_price_z_score(historical_prices: pd.DataFrame, window: int) -> flo
     if pd.isna(current_std) or current_std == 0: return 0.0
     return (current_log_price - current_mean) / current_std
 
-# --- THIS IS THE FINAL, CORRECTED SCREENER FUNCTION ---
 @st.cache_data(ttl=600)
 def create_global_option_screener(options_df, live_price, risk_free_rate):
     if options_df.empty or live_price <= 0: return pd.DataFrame()
@@ -168,8 +167,7 @@ def create_global_option_screener(options_df, live_price, risk_free_rate):
         for _, row in filtered_df.iterrows():
             ticker_data = get_instrument_ticker(row['instrument_name'])
             if ticker_data and all(pd.notna(ticker_data.get(k)) for k in ['mark_price', 'iv', 'delta']) and ticker_data.get('mark_price', 0) > 0:
-                # --- DEFINITIVE IV FIX ---
-                iv_raw = ticker_data.get('iv', 0)
+                iv_raw = ticker_data['iv']
                 iv_decimal = iv_raw / 100.0 if iv_raw > 1.0 else iv_raw
                 
                 ttm = row['dte'] / 365.25
@@ -354,11 +352,11 @@ with st.expander("🌍 Global Actionable Option Chain"):
             calls_global = df_filtered[df_filtered['type'] == 'call'].sort_values(by='risk_adjusted_yield', ascending=False)
             puts_global = df_filtered[df_filtered['type'] == 'put'].sort_values(by='risk_adjusted_yield', ascending=False)
             cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%']
-            style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.2f}M', 'cushion_%': '{:.1f}%'}
             
-            # --- NEW FORMATTING FOR THETA/GAMMA RATIO ---
-            calls_global['theta_gamma_ratio'] /= 1_000_000
-            puts_global['theta_gamma_ratio'] /= 1_000_000
+            # --- CORRECTED FORMATTING LOGIC ---
+            style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.0f}K', 'cushion_%': '{:.1f}%'}
+            calls_global['theta_gamma_ratio'] /= 1000
+            puts_global['theta_gamma_ratio'] /= 1000
 
             st.subheader("Best Call Candidates (Sorted by Best Yield)")
             if not calls_global.empty:
