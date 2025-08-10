@@ -106,7 +106,7 @@ def calculate_rv(prices: pd.Series, window: int = 30) -> float:
     log_returns = np.log(prices / prices.shift(1)); return log_returns.rolling(window=window).std().iloc[-1] * np.sqrt(365)
 def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
     delta = prices.diff(); gain = delta.where(delta > 0, 0); loss = -delta.where(delta < 0, 0); avg_gain = gain.ewm(com=period - 1, min_periods=period).mean(); avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    if avg_loss.iloc[-1] == 0: return 100.0
+    if avg_loss.empty or avg_loss.iloc[-1] == 0: return 100.0
     rs = avg_gain.iloc[-1] / avg_loss.iloc[-1]; return 100 - (100 / (1 + rs))
 
 def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp):
@@ -123,12 +123,9 @@ def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with
 # =====================================================================================
 # ==                      STRATEGY ENGINE & DECISION LOGIC                       ==
 # =====================================================================================
-
 def generate_optimal_strategy(iv, rv, rsi_daily, rsi_hourly, thresholds):
-    """The Primary Engine: Determines the best strategy using a dual-RSI trend filter."""
     if rv > 0 and iv < rv * (1 + thresholds['min_iv_rv_premium']):
         return {'action': 'HOLD', 'reason': f"IV ({iv:.1%}) is not sufficiently above RV ({rv:.1%}). No statistical edge."}
-    
     if rsi_daily > thresholds['rsi_overbought'] and rsi_hourly > 50:
         return {'action': 'SELL_PUT', 'reason': f"Confirmed Bullish Trend (Daily RSI: {rsi_daily:.1f}, Hourly > 50). Selling puts captures premium while retaining upside."}
     elif rsi_daily < thresholds['rsi_oversold'] and rsi_hourly < 50:
@@ -162,7 +159,6 @@ def find_best_option_to_sell(options_df, option_type, target_delta, min_premium_
 # =====================================================================================
 # ==                              UI & APP LAYOUT                                  ==
 # =====================================================================================
-
 st.title("Autonomint Quant Strategy Optimizer")
 with st.sidebar:
     st.header("1. Core Position"); ETH_DEPOSITED = st.number_input("ETH Deposited", 1.0, 10.0, 2.0, 0.5); ETH_PRICE_INITIAL = st.number_input("Initial ETH Price ($)", 1000.0, 10000.0, 2000.0, 100.0); AAVE_APY = st.slider("AAVE Supply APY (%)", 0.1, 10.0, 3.0, 0.1) / 100.0; LTV = st.slider("Loan-to-Value (LTV) (%)", 50.0, 95.0, 80.0, 1.0) / 100.0
@@ -213,7 +209,12 @@ with pcol1:
     total_pnl, pnl_underlying, pnl_aave, pnl_dcds, pnl_option, pnl_perp = calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp)
     st.metric("Total Projected PnL at Target Price", f"${total_pnl:,.2f}")
     with st.expander("Show PnL Contribution Breakdown"):
-        st.metric("PnL from Underlying ETH", f"${pnl_underlying:,.2f}", delta_color="off"); st.metric("PnL from AAVE Yield", f"${pnl_aave::.2f}"); st.metric("PnL from dCDS (Net)", f"${pnl_dcds:,.2f}"); st.metric("PnL from Sold Options", f"${pnl_option:,.2f}"); st.metric("PnL from Perpetual Hedge", f"${pnl_perp:,.2f}")
+        st.metric("PnL from Underlying ETH", f"${pnl_underlying:,.2f}", delta_color="off")
+        # --- THIS IS THE FIX ---
+        st.metric("PnL from AAVE Yield", f"${pnl_aave:.2f}")
+        st.metric("PnL from dCDS (Net)", f"${pnl_dcds:,.2f}")
+        st.metric("PnL from Sold Options", f"${pnl_option:,.2f}")
+        st.metric("PnL from Perpetual Hedge", f"${pnl_perp:,.2f}")
 with pcol2:
     price_range = np.linspace(ETH_PRICE_INITIAL * 0.6, ETH_PRICE_INITIAL * 1.4, 200)
     pnl_values = [calculate_final_pnl(p, params, sold_put, sold_call, hedge_with_perp)[0] for p in price_range]
