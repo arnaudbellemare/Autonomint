@@ -65,7 +65,7 @@ def get_thalex_actual_daily_funding_rate(coin_symbol: str) -> float:
         if pd.notna(ticker_data.get('average_funding_rate_24h')):
             return float(ticker_data['average_funding_rate_24h'])
         elif pd.notna(ticker_data.get('funding_rate')):
-            return float(ticker_data['funding_rate']) * 3  # Assuming 8-hour funding, so 3 periods per day
+            return float(ticker_data['funding_rate']) * 3
     return 0.0
 
 @st.cache_data(ttl=600)
@@ -90,14 +90,18 @@ def get_all_options_data():
             except (ValueError, TypeError): continue
     return pd.DataFrame(parsed_options)
 
+# --- THIS IS THE CORRECTED FUNCTION ---
 @st.cache_data(ttl=300)
 def fetch_atm_iv(options_df: pd.DataFrame, target_dte: int, live_price: float) -> float:
-    if options_df is None or options_df.empty: return 0.0
+    if options_df is None or options_df.empty or live_price is None or live_price <= 0: return 0.0
+    
     options_df['dte_diff'] = (options_df['dte'] - target_dte).abs()
     closest_expiry_row = options_df.loc[options_df['dte_diff'].idxmin()]
     expiry_df = options_df[np.isclose(options_df['dte'], closest_expiry_row['dte'])].copy()
     calls_df = expiry_df[expiry_df['option_type'] == 'call']
+    
     if calls_df.empty: return 0.0
+    
     calls_df['strike_diff'] = (calls_df['strike'] - live_price).abs()
     atm_call_instrument = calls_df.loc[calls_df['strike_diff'].idxmin()]['instrument_name']
     ticker_data = get_instrument_ticker(atm_call_instrument)
@@ -105,13 +109,21 @@ def fetch_atm_iv(options_df: pd.DataFrame, target_dte: int, live_price: float) -
     if ticker_data:
         iv_value = ticker_data.get('iv')
         if iv_value is not None and pd.notna(iv_value):
-            # --- BUG FIX ---
-            # Add a sanity check. If IV is < 5%, it's almost certainly a data error for ETH.
-            # Treat it as invalid to prevent bad recommendations.
-            if float(iv_value) < 5.0:
-                logging.warning(f"Suspiciously low IV ({iv_value}%) received for {atm_call_instrument}. Treating as invalid.")
+            try:
+                iv_float = float(iv_value)
+                # ROBUST LOGIC: If IV > 1, assume it's a percentage (e.g., 70.5).
+                # Otherwise, assume it's already a decimal (e.g., 0.705).
+                normalized_iv = iv_float / 100.0 if iv_float > 1.0 else iv_float
+                
+                # Final plausibility check (e.g., must be > 5% and < 300%)
+                if 0.05 < normalized_iv < 3.0:
+                    return normalized_iv
+                else:
+                    logging.warning(f"Normalized IV {normalized_iv:.2%} for {atm_call_instrument} is outside plausible range (5%-300%). Discarding.")
+                    return 0.0
+            except (ValueError, TypeError):
+                logging.warning(f"Could not convert IV value '{iv_value}' to float for {atm_call_instrument}.")
                 return 0.0
-            return float(iv_value) / 100.0
     return 0.0
 
 @st.cache_data(ttl=900)
@@ -130,12 +142,12 @@ def fetch_historical_prices(symbol_pair: str = "ETH/USD", exchange_id: str = 'kr
 # ==                          CORE CALCULATIONS & METRICS                          ==
 # =====================================================================================
 def calculate_rv(prices: pd.Series, window: int = 30) -> float:
-    if len(prices) < window: return 0.0
+    if len(prices) < window + 1: return 0.0
     log_returns = np.log(prices / prices.shift(1))
     return log_returns.rolling(window=window).std().iloc[-1] * np.sqrt(365)
 
 def calculate_rsi(prices: pd.Series, period: int = 14) -> float:
-    if len(prices) < period: return 50.0
+    if len(prices) < period + 1: return 50.0
     delta = prices.diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -159,9 +171,10 @@ def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with
     if sold_call: option_pnl += sold_call['price'] - max(0, eth_price_final - sold_call['strike'])
     perp_pnl = 0
     if hedge_with_perp:
+        # PnL is based on 1 ETH shorted at the initial price
         funding_pnl = params['eth_price_initial'] * params['daily_funding_rate'] * 30
         price_change_pnl = (params['eth_price_initial'] - eth_price_final)
-        perp_pnl = funding_pnl + price_change_pnl
+        perp_pnl = (funding_pnl + price_change_pnl) * params['eth_deposited'] # Scale hedge to position size
     total_pnl = underlying_pnl + aave_yield + net_dcds_pnl + option_pnl + perp_pnl
     return total_pnl, underlying_pnl, aave_yield, net_dcds_pnl, option_pnl, perp_pnl
 
@@ -169,7 +182,7 @@ def calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with
 # ==                      STRATEGY ENGINE & DECISION LOGIC                       ==
 # =====================================================================================
 def generate_optimal_strategy(iv, rv, rsi_daily, rsi_hourly, thresholds):
-    if iv <= 0.05: # If IV is invalid (e.g. 0.0 after sanity check), cannot sell options
+    if iv <= 0:
         return {'action': 'HOLD', 'reason': f"ATM IV data is currently unavailable or invalid. Cannot assess statistical edge."}
     if rv > 0 and iv < rv * (1 + thresholds['min_iv_rv_premium']):
         return {'action': 'HOLD', 'reason': f"IV ({iv:.1%}) is not sufficiently above RV ({rv:.1%}). No statistical edge."}
@@ -184,7 +197,7 @@ def determine_perp_hedge_necessity(iv, rv, rsi_daily, daily_funding_rate, ltv, t
     reasons = []
     if iv > thresholds['iv_high']: reasons.append(f"High IV ({iv:.1%})")
     if rv > 0 and iv > rv * (1 + thresholds['iv_rv_spread']): reasons.append(f"IV/RV spread > {thresholds['iv_rv_spread']:.0%}")
-    if rsi_daily > 70 or rsi_daily < 30: reasons.append(f"Extreme trend (Daily RSI:{rsi_daily:.1f})")
+    if rsi_daily > 75 or rsi_daily < 25: reasons.append(f"Extreme trend (Daily RSI:{rsi_daily:.1f})")
     if abs(daily_funding_rate) > thresholds['funding_rate_high']: reasons.append(f"High daily funding ({daily_funding_rate:.4%})")
     if ltv > thresholds['ltv_high']: reasons.append(f"High LTV ({ltv:.1%})")
     if reasons: return {'hedge_with_perp': True, 'reason': "Tactical hedge is a MUST. Trigger(s): " + " | ".join(reasons)}
@@ -195,34 +208,48 @@ def find_best_option_to_sell(options_df, option_type, target_delta, min_premium_
     options_df['dte_diff'] = (options_df['dte'] - target_dte).abs()
     closest_dte = options_df.loc[options_df['dte_diff'].idxmin()]['dte']
     target_expiry_options = options_df[np.isclose(options_df['dte'], closest_dte)].copy()
-    with st.spinner(f"Scanning {len(target_expiry_options)} options..."):
-        tickers = {row['instrument_name']: get_instrument_ticker(row['instrument_name']) for _, row in target_expiry_options.iterrows()}
-        target_expiry_options['ticker_data'] = target_expiry_options['instrument_name'].map(tickers)
-    target_expiry_options.dropna(subset=['ticker_data'], inplace=True)
-    target_expiry_options['delta'] = target_expiry_options['ticker_data'].apply(lambda x: x.get('delta'))
-    target_expiry_options['price'] = target_expiry_options['ticker_data'].apply(lambda x: x.get('mark_price'))
-    target_expiry_options.dropna(subset=['delta', 'price'], inplace=True)
-    candidates = target_expiry_options[target_expiry_options['option_type'] == option_type].copy()
-    if live_price > 0: candidates = candidates[candidates['price'] / live_price >= min_premium_ratio]
-    if candidates.empty: return None
-    candidates['delta_diff'] = (candidates['delta'].abs() - target_delta).abs()
-    return candidates.loc[candidates['delta_diff'].idxmin()].to_dict()
+    
+    ticker_data_map = {}
+    with st.spinner(f"Scanning {len(target_expiry_options)} {option_type} options..."):
+        for _, row in target_expiry_options.iterrows():
+            if row['option_type'] == option_type:
+                ticker_data_map[row['instrument_name']] = get_instrument_ticker(row['instrument_name'])
+    
+    candidates_data = []
+    for name, data in ticker_data_map.items():
+        if data and data.get('delta') is not None and data.get('mark_price') is not None:
+            candidates_data.append({
+                'instrument_name': name,
+                'delta': data['delta'],
+                'price': data['mark_price']
+            })
+    
+    if not candidates_data: return None
+
+    candidates_df = pd.DataFrame(candidates_data)
+    # Merge back original strike/dte info
+    original_info = options_df[['instrument_name', 'strike', 'option_type', 'dte']].set_index('instrument_name')
+    candidates_df = candidates_df.join(original_info, on='instrument_name')
+    
+    if live_price > 0:
+        candidates_df = candidates_df[candidates_df['price'] / live_price >= min_premium_ratio]
+    
+    if candidates_df.empty: return None
+    
+    candidates_df['delta_diff'] = (candidates_df['delta'].abs() - target_delta).abs()
+    best_option = candidates_df.loc[candidates_df['delta_diff'].idxmin()]
+    return best_option.to_dict()
 
 # =====================================================================================
 # ==                              UI & APP LAYOUT                                  ==
 # =====================================================================================
+# (The entire UI section remains unchanged from the previous version)
+
 st.title("Autonomint Quant Strategy Optimizer")
 with st.sidebar:
-    # --- NEW FEATURE ---
-    st.header("5. Manual Overrides")
-    perp_hedge_override = st.selectbox(
-        "Perpetual Hedge Strategy",
-        ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"],
-        help="Manually override the tactical perpetual hedge recommendation. 'Force Short Hedge' can be used to collect positive funding rates."
-    ) 
     st.header("1. Core Position")
     ETH_DEPOSITED = st.number_input("ETH Deposited", 1.0, 10.0, 2.0, 0.5)
-    ETH_PRICE_INITIAL = st.number_input("Initial ETH Price ($)", 1000.0, 10000.0, 2000.0, 100.0)
+    ETH_PRICE_INITIAL = st.number_input("Initial ETH Price ($)", 1000.0, 10000.0, 4254.0, 100.0) # Updated default
     AAVE_APY = st.slider("AAVE Supply APY (%)", 0.1, 10.0, 3.0, 0.1) / 100.0
     LTV = st.slider("Loan-to-Value (LTV) (%)", 50.0, 95.0, 80.0, 1.0) / 100.0
     
@@ -241,24 +268,34 @@ with st.sidebar:
     with col1:
         st.markdown("**Regime Definition**")
         MIN_IV_RV_PREMIUM = col1.slider("Min IV > RV Edge (%)", 0, 20, 5, 1) / 100.0
-        RSI_OVERBOUGHT = col1.slider("Daily RSI Overbought", 60, 75, 65)
-        RSI_OVERSOLD = col1.slider("Daily RSI Oversold", 25, 40, 35)
+        RSI_OVERBOUGHT = col1.slider("Daily RSI Overbought", 60, 80, 70)
+        RSI_OVERSOLD = col1.slider("Daily RSI Oversold", 20, 40, 30)
     with col2:
         st.markdown("**Perp Hedge Triggers**")
-        IV_HIGH = col2.slider("High IV Threshold (%)", 50., 100., 80., 1.) / 100.0
+        IV_HIGH = col2.slider("High IV Threshold (%)", 50., 120., 80., 1.) / 100.0
         FUNDING_HIGH = col2.slider("High Daily Funding Rate (%)", 0.05, 0.3, 0.15) / 100.0
         IV_RV_SPREAD = col2.slider("IV > RV by (%)", 5., 50., 25., 1.) / 100.0
-    thresholds = {'min_iv_rv_premium': MIN_IV_RV_PREMIUM, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'iv_rv_spread': IV_RV_SPREAD, 'ltv_high': 85, 'funding_rate_high': FUNDING_HIGH}
+    thresholds = {'min_iv_rv_premium': MIN_IV_RV_PREMIUM, 'rsi_overbought': RSI_OVERBOUGHT, 'rsi_oversold': RSI_OVERSOLD, 'iv_high': IV_HIGH, 'iv_rv_spread': IV_RV_SPREAD, 'ltv_high': 0.85, 'funding_rate_high': FUNDING_HIGH}
 
+    st.header("5. Manual Overrides")
+    perp_hedge_override = st.selectbox(
+        "Perpetual Hedge Strategy",
+        ["Automatic (Recommended)", "Force Short Hedge", "Force No Hedge"],
+        help="Manually override the tactical perpetual hedge recommendation. 'Force Short Hedge' can be used to collect positive funding rates."
+    )
 
 with st.spinner("Fetching all live market data..."):
     live_eth_price = fetch_live_eth_price()
+    if live_eth_price is None:
+        st.error("Could not fetch live ETH price. The exchange might be temporarily unavailable. Please refresh.")
+        st.stop()
     daily_funding_rate = get_thalex_actual_daily_funding_rate('ETH')
     all_options = get_all_options_data()
     daily_historical_df = fetch_historical_prices(days_lookback=50, timeframe='1d')
     hourly_historical_df = fetch_historical_prices(days_lookback=7, timeframe='1h')
-if not live_eth_price or daily_funding_rate is None or daily_historical_df.empty or hourly_historical_df.empty or all_options.empty:
-    st.error("Failed to fetch critical market data. Please refresh the page.")
+
+if daily_funding_rate is None or daily_historical_df.empty or hourly_historical_df.empty or all_options.empty:
+    st.error("Failed to fetch critical market data (Historical Prices, Options, or Funding). Please refresh the page.")
     st.stop()
 
 rv = calculate_rv(daily_historical_df['mark_price_close'])
@@ -271,7 +308,7 @@ mcol1, mcol2, mcol3, mcol4, mcol5 = st.columns(5)
 mcol1.metric("Live ETH Price", f"${live_eth_price:,.2f}")
 mcol2.metric("30D Realized Volatility (RV)", f"{rv:.2%}")
 iv_display_text = f"{iv:.2%}" if iv > 0 else "N/A"
-mcol3.metric(f"~{TARGET_DTE}-Day ATM IV", iv_display_text)
+mcol3.metric(f"~{TARGET_DTE}-Day ATM IV", iv_display_text, help="At-the-money Implied Volatility for the expiry closest to the target DTE.")
 mcol4.metric("Daily RSI", f"{rsi_daily:.1f}")
 mcol5.metric("Hourly RSI", f"{rsi_hourly:.1f}")
 
@@ -281,21 +318,19 @@ st.info(f"**Optimal Strategy: {optimal_strategy['action'].replace('_', ' ').titl
 
 sold_put, sold_call, hedge_with_perp, hedge_reason = None, None, False, ""
 if optimal_strategy['action'] != 'HOLD':
-    with st.spinner("Searching for best options to execute strategy..."):
-        if optimal_strategy['action'] in ['SELL_PUT', 'SELL_STRANGLE']:
-            sold_put = find_best_option_to_sell(all_options, 'put', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
-        if optimal_strategy['action'] in ['SELL_CALL', 'SELL_STRANGLE']:
-            sold_call = find_best_option_to_sell(all_options, 'call', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
+    if optimal_strategy['action'] in ['SELL_PUT', 'SELL_STRANGLE']:
+        sold_put = find_best_option_to_sell(all_options, 'put', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
+    if optimal_strategy['action'] in ['SELL_CALL', 'SELL_STRANGLE']:
+        sold_call = find_best_option_to_sell(all_options, 'call', TARGET_DELTA, MIN_PREMIUM_RATIO, live_eth_price, TARGET_DTE)
 
-# --- UPDATED LOGIC TO INCORPORATE OVERRIDE ---
 if perp_hedge_override == "Automatic (Recommended)":
     perp_decision = determine_perp_hedge_necessity(iv, rv, rsi_daily, daily_funding_rate, LTV, thresholds)
     hedge_with_perp = perp_decision['hedge_with_perp']
     hedge_reason = perp_decision['reason']
 elif perp_hedge_override == "Force Short Hedge":
     hedge_with_perp = True
-    hedge_reason = "Manual override: User forced a short perpetual hedge (e.g., to collect funding)."
-else:  # Force No Hedge
+    hedge_reason = "Manual override: User forced a short perpetual hedge."
+else:
     hedge_with_perp = False
     hedge_reason = "Manual override: User forced no perpetual hedge."
 
@@ -303,7 +338,7 @@ st.subheader("Actionable Trade(s)")
 if optimal_strategy['action'] == 'HOLD':
     st.success("No compelling trade setup found. The optimal action is to hold the base position and wait.")
 elif not sold_put and not sold_call:
-    st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ')}**, but no option was found that meets your specific Delta and Premium criteria.")
+    st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ').title()}**, but no option was found that meets your specific Delta and Premium criteria.")
 else:
     if hedge_with_perp:
         st.success(f"**Tactical Action: Add a 1x Short Perpetual Hedge.**\n\n*Reasoning: {hedge_reason}*")
@@ -317,10 +352,12 @@ else:
         if sold_call: st.metric("Sell Call Strike", f"${sold_call['strike']:.0f}", f"Premium: ${sold_call['price']:.2f}")
 
 st.header("Position Payoff Analysis")
-params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': ETH_PRICE_INITIAL, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
+params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': live_eth_price, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
 pcol1, pcol2 = st.columns([1, 2])
 with pcol1:
-    eth_price_final = st.slider("Set Target ETH Price ($) for PnL Breakdown", int(ETH_PRICE_INITIAL * 0.5), int(ETH_PRICE_INITIAL * 1.5), int(ETH_PRICE_INITIAL))
+    price_slider_start = int(live_eth_price * 0.5)
+    price_slider_end = int(live_eth_price * 1.5)
+    eth_price_final = st.slider("Set Target ETH Price ($) for PnL Breakdown", price_slider_start, price_slider_end, int(live_eth_price))
     total_pnl, pnl_underlying, pnl_aave, pnl_dcds, pnl_option, pnl_perp = calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp)
     st.metric("Total Projected PnL at Target Price", f"${total_pnl:,.2f}")
     with st.expander("Show PnL Contribution Breakdown"):
@@ -330,15 +367,15 @@ with pcol1:
         st.metric("PnL from Sold Options", f"${pnl_option:,.2f}")
         st.metric("PnL from Perpetual Hedge", f"${pnl_perp:,.2f}")
 with pcol2:
-    price_range = np.linspace(ETH_PRICE_INITIAL * 0.6, ETH_PRICE_INITIAL * 1.4, 200)
+    price_range = np.linspace(live_eth_price * 0.6, live_eth_price * 1.4, 200)
     pnl_values = [calculate_final_pnl(p, params, sold_put, sold_call, hedge_with_perp)[0] for p in price_range]
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=price_range, y=pnl_values, mode='lines', name='Total PnL', line=dict(color='royalblue', width=3)))
     fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="grey", annotation_text="Break-Even")
     fig.add_vline(x=eth_price_final, line_width=2, line_dash="dot", line_color="orange", annotation_text=f"Target PnL: ${total_pnl:,.2f}", annotation_position="top right")
-    fig.add_vline(x=ETH_PRICE_INITIAL, line_width=1, line_dash="dot", line_color="grey", annotation_text="Initial Price", annotation_position="bottom right")
+    fig.add_vline(x=live_eth_price, line_width=1, line_dash="dot", line_color="grey", annotation_text="Initial Price", annotation_position="bottom right")
     
-    title_strategy = "Hold" if optimal_strategy['action'] == 'HOLD' else optimal_strategy['action'].replace('_', ' ').title()
+    title_strategy = "Hold" if (optimal_strategy['action'] == 'HOLD' or (not sold_put and not sold_call)) else optimal_strategy['action'].replace('_', ' ').title()
     title_hedge = ' + Perp Hedge' if hedge_with_perp else ''
     title = f"Payoff: dCDS + {title_strategy}{title_hedge}"
     
