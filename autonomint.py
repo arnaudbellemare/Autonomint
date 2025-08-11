@@ -351,8 +351,8 @@ with st.expander("🌍 Global Actionable Option Chain"):
             
             avg_call_score = calls_global['holistic_score'].mean() if not calls_global.empty else 0
             avg_put_score = puts_global['holistic_score'].mean() if not puts_global.empty else 0
-
             st.subheader("Screener Verdict")
+            explanation_text = "" # Initialize empty string
             v_col1, v_col2, v_col3 = st.columns(3)
             with v_col1:
                 st.metric("Avg. Call Score", f"{avg_call_score:.1f}", help="The average Holistic Score for all filtered Call options.")
@@ -362,11 +362,28 @@ with st.expander("🌍 Global Actionable Option Chain"):
                 if avg_put_score > avg_call_score:
                     verdict_text = "Puts are Richer"
                     delta_color = "normal"
+                    explanation_text = """
+                    <small>
+                    <b>Higher Relative Value:</b> Put sellers are being compensated better for the risks they are taking.
+                    <br>
+                    <b>Market Sentiment Skew:</b> There is strong demand for downside protection, likely driven by fear. This demand inflates the risk-adjusted value of puts.
+                    </small>
+                    """
                 else:
                     verdict_text = "Calls are Richer"
                     delta_color = "inverse"
+                    explanation_text = """
+                    <small>
+                    <b>Higher Relative Value:</b> Call sellers are being compensated better for the risks they are taking.
+                    <br>
+                    <b>Market Sentiment Skew:</b> There is strong demand for upside exposure, likely driven by speculation or "FOMO". This demand inflates the risk-adjusted value of calls.
+                    </small>
+                    """
                 st.metric("Market Skew Verdict", verdict_text, f"{abs(avg_put_score - avg_call_score):.1f} pts", delta_color=delta_color)
-            
+
+            # Display the explanation text below the metrics
+            if explanation_text:
+                st.markdown(explanation_text, unsafe_allow_html=True)
             cols_to_display = ['instrument', 'expiry', 'DTE', 'strike', 'premium', 'iv', 'delta', 'risk_adjusted_yield', 'theta_gamma_ratio', 'cushion_%', 'holistic_score']
             calls_global['theta_gamma_ratio'] /= 1000; puts_global['theta_gamma_ratio'] /= 1000
             style_formats = {'DTE': '{:.1f}', 'strike': '{:,.0f}', 'premium': '${:,.4f}', 'iv': '{:.2%}', 'delta': '{:.3f}', 'risk_adjusted_yield': '{:.2%}', 'theta_gamma_ratio': '{:,.0f}K', 'cushion_%': '{:.1f}%', 'holistic_score': '{:.1f}'}
