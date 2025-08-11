@@ -326,7 +326,21 @@ if optimal_strategy['action'] != 'HOLD':
 if perp_hedge_override == "Automatic (Recommended)": perp_decision = determine_perp_hedge_necessity(iv, rv, rsi_daily, daily_funding_rate, LTV, thresholds); hedge_with_perp = perp_decision['hedge_with_perp']; hedge_reason = perp_decision['reason']
 elif perp_hedge_override == "Force Short Hedge": hedge_with_perp = True; hedge_reason = "Manual override: User forced a short perpetual hedge."
 else: hedge_with_perp = False; hedge_reason = "Manual override: User forced no perpetual hedge."
-
+st.header("Position Payoff Analysis")
+params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': live_eth_price, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
+pcol1, pcol2 = st.columns([1, 2])
+with pcol1:
+    price_slider_start = int(live_eth_price * 0.5); price_slider_end = int(live_eth_price * 1.5); eth_price_final = st.slider("Set Target ETH Price ($) for PnL Breakdown", price_slider_start, price_slider_end, int(live_eth_price))
+    total_pnl, pnl_underlying, pnl_aave, pnl_dcds, pnl_option, pnl_perp = calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp)
+    st.metric("Total Projected PnL at Target Price", f"${total_pnl:,.2f}")
+    with st.expander("Show PnL Contribution Breakdown"): st.metric("PnL from Underlying ETH", f"${pnl_underlying:,.2f}", delta_color="off"); st.metric("PnL from AAVE Yield", f"${pnl_aave:.2f}"); st.metric("PnL from dCDS (Net)", f"${pnl_dcds:,.2f}"); st.metric("PnL from Sold Options", f"${pnl_option:.2f}"); st.metric("PnL from Perpetual Hedge", f"${pnl_perp:.2f}")
+with pcol2:
+    price_range = np.linspace(live_eth_price * 0.6, live_eth_price * 1.4, 200); pnl_values = [calculate_final_pnl(p, params, sold_put, sold_call, hedge_with_perp)[0] for p in price_range]
+    fig = go.Figure(); fig.add_trace(go.Scatter(x=price_range, y=pnl_values, mode='lines', name='Total PnL', line=dict(color='royalblue', width=3))); fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="grey", annotation_text="Break-Even"); fig.add_vline(x=eth_price_final, line_width=2, line_dash="dot", line_color="orange", annotation_text=f"Target PnL: ${total_pnl:,.2f}", annotation_position="top right"); fig.add_vline(x=live_eth_price, line_width=1, line_dash="dot", line_color="grey", annotation_text="Initial Price", annotation_position="bottom right")
+    title_strategy = "Hold" if (optimal_strategy['action'] == 'HOLD' or (optimal_strategy['action'] != 'HOLD' and not sold_put and not sold_call)) else optimal_strategy['action'].replace('_', ' ').title()
+    title_hedge = ' + Perp Hedge' if hedge_with_perp else ''
+    title = f"Payoff: dCDS + {title_strategy}{title_hedge}"; fig.update_layout(title=title, xaxis_title="ETH Price at Expiry ($)", yaxis_title="Overall Profit / Loss ($)", yaxis_tickprefix='$', margin=dict(l=40, r=40, t=50, b=40))
+    st.plotly_chart(fig, use_container_width=True)
 st.subheader("Actionable Trade(s)")
 if optimal_strategy['action'] == 'HOLD': st.success("No compelling trade setup found. The optimal action is to hold the base position and wait.")
 elif optimal_strategy['action'] != 'HOLD' and not sold_put and not sold_call: st.warning(f"Engine recommended to **{optimal_strategy['action'].replace('_', ' ')}**, but no option was found that meets your specific criteria for the target DTE.")
@@ -407,18 +421,4 @@ with st.expander("🌍 Global Actionable Option Chain"):
     else:
         st.warning("Could not retrieve data for Global Actionable Chain analysis.")
 
-st.header("Position Payoff Analysis")
-params = {'eth_deposited': ETH_DEPOSITED, 'eth_price_initial': live_eth_price, 'aave_apy': AAVE_APY, 'daily_funding_rate': daily_funding_rate, 'dcds_coverage_percent': DCDS_COVERAGE_PERCENT, 'dcds_fee_percent': DCDS_FEE_PERCENT, 'dcds_upside_sharing_percent': DCDS_UPSIDE_SHARING_PERCENT}
-pcol1, pcol2 = st.columns([1, 2])
-with pcol1:
-    price_slider_start = int(live_eth_price * 0.5); price_slider_end = int(live_eth_price * 1.5); eth_price_final = st.slider("Set Target ETH Price ($) for PnL Breakdown", price_slider_start, price_slider_end, int(live_eth_price))
-    total_pnl, pnl_underlying, pnl_aave, pnl_dcds, pnl_option, pnl_perp = calculate_final_pnl(eth_price_final, params, sold_put, sold_call, hedge_with_perp)
-    st.metric("Total Projected PnL at Target Price", f"${total_pnl:,.2f}")
-    with st.expander("Show PnL Contribution Breakdown"): st.metric("PnL from Underlying ETH", f"${pnl_underlying:,.2f}", delta_color="off"); st.metric("PnL from AAVE Yield", f"${pnl_aave:.2f}"); st.metric("PnL from dCDS (Net)", f"${pnl_dcds:,.2f}"); st.metric("PnL from Sold Options", f"${pnl_option:.2f}"); st.metric("PnL from Perpetual Hedge", f"${pnl_perp:.2f}")
-with pcol2:
-    price_range = np.linspace(live_eth_price * 0.6, live_eth_price * 1.4, 200); pnl_values = [calculate_final_pnl(p, params, sold_put, sold_call, hedge_with_perp)[0] for p in price_range]
-    fig = go.Figure(); fig.add_trace(go.Scatter(x=price_range, y=pnl_values, mode='lines', name='Total PnL', line=dict(color='royalblue', width=3))); fig.add_hline(y=0, line_width=1, line_dash="dash", line_color="grey", annotation_text="Break-Even"); fig.add_vline(x=eth_price_final, line_width=2, line_dash="dot", line_color="orange", annotation_text=f"Target PnL: ${total_pnl:,.2f}", annotation_position="top right"); fig.add_vline(x=live_eth_price, line_width=1, line_dash="dot", line_color="grey", annotation_text="Initial Price", annotation_position="bottom right")
-    title_strategy = "Hold" if (optimal_strategy['action'] == 'HOLD' or (optimal_strategy['action'] != 'HOLD' and not sold_put and not sold_call)) else optimal_strategy['action'].replace('_', ' ').title()
-    title_hedge = ' + Perp Hedge' if hedge_with_perp else ''
-    title = f"Payoff: dCDS + {title_strategy}{title_hedge}"; fig.update_layout(title=title, xaxis_title="ETH Price at Expiry ($)", yaxis_title="Overall Profit / Loss ($)", yaxis_tickprefix='$', margin=dict(l=40, r=40, t=50, b=40))
-    st.plotly_chart(fig, use_container_width=True)
+
